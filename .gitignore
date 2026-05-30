@@ -1,0 +1,6 @@
+# Exclude large zip files
+dataset/dataset.zip
+*.zip
+
+# Exclude video files
+*.mp4

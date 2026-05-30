@@ -1,0 +1,8 @@
+# dataset.yaml
+path: /content/dataset # 구글 코랩에 업로드될 가상 데이터셋의 최상위 폴더 경로
+train: images # 학습용 이미지 폴더명 (dataset/images가 됨)
+val: images # 검증용 이미지 폴더명 (가상 데이터셋이므로 일단 동일하게 지정)
+
+# 클래스(객체 종류) 정보 정의
+names:
+  0: vertiport
