@@ -1,5 +1,48 @@
 자세히 설명 : https://blog.naver.com/jinydoggebi/224300774260
 
+////////////////////////////////////////////////////////////
+# 시각 마커 기반 드론 정밀 착륙 시스템 요약
+
+## 전체 구성
+**D435i 카메라 → Jetson Nano (YOLOv8 + TensorRT) → Pixhawk (FC)**
+
+---
+
+## 핵심 파이프라인
+
+1. **착륙 패드 인식** : D435i RGB 카메라로 착륙 마크(검은 'V'자 원형 패드)를 YOLOv8이 실시간 검출
+2. **3D 좌표 계산** : AI가 찾은 중심 픽셀(cx, cy)에서 D435i 깊이 센서로 거리(Z)를 측정, `rs2_deproject_pixel_to_point()`로 X/Y/Z 오프셋을 미터 단위로 변환
+3. **드론 제어 전송** : pymavlink로 `LANDING_TARGET` 메시지를 Pixhawk에 전송 → 드론이 패드 중심으로 유도되며 착륙
+
+---
+
+## 구현 단계 요약
+
+| 단계 | 내용 |
+|------|------|
+| 데이터셋 생성 | Python 스크립트로 착륙 패드 PNG를 아스팔트 배경에 합성 (1,000장 자동 생성) |
+| AI 학습 | Google Colab (T4 GPU)에서 YOLOv8-nano 100 epoch 학습 → `best.pt` 생성 |
+| 경량화 | Jetson에서 `trtexec`로 ONNX → TensorRT 엔진(`best.engine`) 변환 |
+| 실행 | pycuda 없이 ctypes + TensorRT 직접 구동 (메모리 부족 문제 우회) |
+
+---
+
+## 주요 트러블슈팅
+
+- **ultralytics 설치 불가** : Jetson의 Python 3.6 버전 호환 문제 → ultralytics 없이 TensorRT 엔진 직접 구동으로 해결
+- **메모리 부족(cuMemHostAlloc)** : pycuda 제거 후 ctypes 정적 버퍼 방식으로 교체
+- **TensorRT 변환 오류(Colab)** : Colab의 TensorRT 11 버전 버그 → Jetson 자체 `trtexec`로 변환
+
+---
+
+## 최종 결과
+착륙 패드를 실시간으로 인식하고 화면에 바운딩 박스와 함께 **X/Y 오프셋, Z 고도**를 cm 단위로 표시, Pixhawk로 MAVLink 신호 전송까지 성공적으로 동작 확인.
+
+////////////////////////////////////////////////////////////
+
+
+
+
 images+labels =기본 이미지(land_mark_3x3m.png) + 배경이미지(backgrounds)
 windows의 wsl에서
 $pip install opencv-python numpy
