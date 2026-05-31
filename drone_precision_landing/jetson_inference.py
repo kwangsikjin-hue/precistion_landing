@@ -5,21 +5,39 @@ import tensorrt as trt
 import ctypes
 import math
 import time
+import argparse  # 명령줄 인자를 받기 위한 모듈 추가
 from pymavlink import mavutil
 import subprocess
 
-# --- [0. GStreamer 파이프라인 초기화 (Jetson 하드웨어 가속 코덱 적용)] ---
-gst_pipeline = (
-    "appsrc ! "
-    "videoconvert ! "
-    "video/x-raw,format=I420 ! "
-    "x264enc tune=zerolatency bitrate=1500 speed-preset=superfast key-int-max=30 ! "
-    "h264parse ! "
-    "rtph264pay pt=96 config-interval=1 ! "
-    "udpsink host=192.168.0.30 port=15600 sync=false async=false"
-)
+# --- [0. 명령줄 인자(Argument) 파싱 설정] ---
+parser = argparse.ArgumentParser(description="Jetson Nano AI Inference and GStreamer Streaming")
+parser.add_argument('--stream', type=str, default='off', choices=['on', 'off'],
+                    help="GStreamer UDP 스트리밍을 켤지 끌지 결정합니다. ('on' 또는 'off')")
+args = parser.parse_args()
 
-out = cv2.VideoWriter(gst_pipeline, cv2.CAP_GSTREAMER, 0, 30, (640, 480))
+# 스트리밍 활성화 여부를 변수에 저장
+ENABLE_STREAMING = (args.stream == 'on')
+
+# --- [1. GStreamer 파이프라인 초기화 (스트리밍 ON일 때만 실행)] ---
+if ENABLE_STREAMING:
+    print("📡 [알림] GStreamer UDP 스트리밍 모드가 켜졌습니다. (Target IP: 192.168.0.30:15600)")
+    gst_pipeline = (
+        "appsrc ! "
+        "videoconvert ! "
+        "video/x-raw,format=I420 ! "
+        # bitrate를 1500에서 800으로 낮춰 네트워크 부하를 줄이고, key-int-max를 15로 줄여 화면 복구 속도 향상
+        "x264enc tune=zerolatency bitrate=800 speed-preset=superfast key-int-max=15 ! "
+        "h264parse ! "
+        # config-interval을 1로 유지하여 메타데이터를 자주 보냄
+        "rtph264pay pt=96 config-interval=1 ! "
+        # 버퍼링 안정성을 위해 큐(queue) 추가
+        "queue max-size-buffers=10 leaky=downstream ! "
+        "udpsink host=192.168.0.30 port=15600 sync=false async=false"
+    )
+    out = cv2.VideoWriter(gst_pipeline, cv2.CAP_GSTREAMER, 0, 30, (640, 480))
+else:
+    print("🖥️ [알림] GStreamer 스트리밍이 꺼져 있습니다. (Local 화면만 표시)")
+    out = None
 
 # --- [MAVLink 드론 비행 제어기 통신 초기화] ---
 try:
@@ -36,7 +54,7 @@ except Exception as e:
     print(f"⚠️ FC 연결 실패: {e}")
     master = None
 
-# --- [1. 메모리 오버헤드가 없는 Jetson 전용 정적 TensorRT 추론 클래스] ---
+# --- [2. 메모리 오버헤드가 없는 Jetson 전용 정적 TensorRT 추론 클래스] ---
 class JetsonTRTEngine:
     def __init__(self, engine_path):
         self.logger = trt.Logger(trt.Logger.WARNING)
@@ -101,7 +119,7 @@ class JetsonTRTEngine:
         )
         return self.outputs[0]['host']
 
-# --- [2. 하드웨어 세팅 (AI Engine 및 리얼센스 D435i)] ---
+# --- [3. 하드웨어 세팅 (AI Engine 및 리얼센스 D435i)] ---
 trt_brain = JetsonTRTEngine('best.engine')
 
 pipeline = rs.pipeline()
@@ -176,14 +194,10 @@ try:
                         # Jetson 터미널 로그 출력
                         print(f"🎯 패드 포착 -> 가로 오차: {offset_x*100:.1f}cm, 세로 오차: {offset_y*100:.1f}cm, 수직고도: {offset_z*100:.1f}cm")
 
-        # =========================================================================
-        # 🔥 수정된 부분: 아래 코드들이 for문과 if문을 완전히 빠져나와 
-        # while True: 와 동일한 레벨(들여쓰기 8칸)에서 실행되도록 수정했습니다.
-        # 이렇게 해야 타겟(패드)이 없어도 빈 화면을 계속 전송하여 MP가 끊기지 않습니다.
-        # =========================================================================
-
-        # 1. Mission Planner (PC)로 GStreamer 영상 송신
-        if out.isOpened():
+        # --- [프레임 송신 및 로컬 화면 출력] ---
+        
+        # 1. Mission Planner (PC)로 GStreamer 영상 송신 (명령줄 옵션이 on일 때만 작동)
+        if ENABLE_STREAMING and out is not None and out.isOpened():
             out.write(color_image)
             
         # 2. 젯슨 나노 로컬 모니터에 영상 출력
@@ -193,7 +207,7 @@ try:
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-# --- [추가/수정됨: 프로그램 안전 종료 및 자원 해제] ---
+# --- [프로그램 안전 종료 및 자원 해제] ---
 except KeyboardInterrupt:
     print("사용자에 의해 프로그램을 종료합니다.")
 except Exception as e:
@@ -202,5 +216,5 @@ finally:
     print("시스템 자원을 해제합니다...")
     pipeline.stop()
     cv2.destroyAllWindows()
-    if out.isOpened():
+    if ENABLE_STREAMING and out is not None and out.isOpened():
         out.release()
