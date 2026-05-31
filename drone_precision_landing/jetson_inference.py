@@ -13,10 +13,10 @@ gst_pipeline = (
     "appsrc ! "
     "videoconvert ! "
     "video/x-raw,format=I420 ! "
-    "nvv4l2h264enc insert-sps-pps=true bitrate=1500000 ! "
+    "x264enc tune=zerolatency bitrate=1500 speed-preset=superfast key-int-max=30 ! "
     "h264parse ! "
     "rtph264pay pt=96 config-interval=1 ! "
-    "udpsink host=192.168.0.30 port=5600 sync=false async=false" # <- PC(Mission Planner) IP
+    "udpsink host=192.168.0.30 port=15600 sync=false async=false"
 )
 
 out = cv2.VideoWriter(gst_pipeline, cv2.CAP_GSTREAMER, 0, 30, (640, 480))
@@ -176,8 +176,12 @@ try:
                         # Jetson 터미널 로그 출력
                         print(f"🎯 패드 포착 -> 가로 오차: {offset_x*100:.1f}cm, 세로 오차: {offset_y*100:.1f}cm, 수직고도: {offset_z*100:.1f}cm")
 
-        # --- [추가/수정됨: 프레임 송신 및 로컬 화면 출력] ---
-        
+        # =========================================================================
+        # 🔥 수정된 부분: 아래 코드들이 for문과 if문을 완전히 빠져나와 
+        # while True: 와 동일한 레벨(들여쓰기 8칸)에서 실행되도록 수정했습니다.
+        # 이렇게 해야 타겟(패드)이 없어도 빈 화면을 계속 전송하여 MP가 끊기지 않습니다.
+        # =========================================================================
+
         # 1. Mission Planner (PC)로 GStreamer 영상 송신
         if out.isOpened():
             out.write(color_image)
