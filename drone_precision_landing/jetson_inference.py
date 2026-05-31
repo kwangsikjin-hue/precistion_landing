@@ -42,7 +42,9 @@ else:
 # --- [MAVLink 드론 비행 제어기 통신 초기화] ---
 try:
     print("⏳ MAVLink 연결 시도 중...")
-    master = mavutil.mavlink_connection('udp:127.0.0.1:14551')
+    # [범용적 솔루션] udpin:0.0.0.0:14551을 사용하여 에러 99를 방지하고,
+    # SITL PC(또는 로컬호스트)로부터 오는 패킷을 모든 네트워크 카드에서 수신 대기합니다.
+    master = mavutil.mavlink_connection('udpin:0.0.0.0:14551')
     
     # 무한 대기(프리징) 방지를 위해 타임아웃 5초 설정
     msg = master.recv_match(type='HEARTBEAT', blocking=True, timeout=5)
@@ -205,18 +207,32 @@ try:
                             try:
                                 tnow = int(time.time() * 1e6)
                                 frame = getattr(mavutil.mavlink, 'MAV_FRAME_BODY_NED', 8)
-                                master.mav.landing_target_send(
-                                    time_usec=tnow,
-                                    target_num=0,
-                                    frame=frame,
-                                    angle_x=angle_x,
-                                    angle_y=angle_y,
-                                    distance=depth_value,
-                                    size_x=0.0,
-                                    size_y=0.0,
-                                    type=2,  # LANDING_TARGET_TYPE_VISION_FIDUCIAL
-                                    position_valid=0
-                                )
+                                try:
+                                    # [방법 A] MAVLink 2 옵션 인자가 지원되는 최신 pymavlink 구문 시도
+                                    master.mav.landing_target_send(
+                                        time_usec=tnow,
+                                        target_num=0,
+                                        frame=frame,
+                                        angle_x=angle_x,
+                                        angle_y=angle_y,
+                                        distance=depth_value,
+                                        size_x=0.0,
+                                        size_y=0.0,
+                                        type=2,  # LANDING_TARGET_TYPE_VISION_FIDUCIAL
+                                        position_valid=0
+                                    )
+                                except TypeError:
+                                    # [방법 B] 구형 pymavlink (MAVLink 1 호환)인 경우 8개 기본 위치 인자만 전송
+                                    master.mav.landing_target_send(
+                                        tnow,         # time_usec
+                                        0,            # target_num
+                                        frame,        # frame
+                                        angle_x,      # angle_x
+                                        angle_y,      # angle_y
+                                        depth_value,  # distance
+                                        0.0,          # size_x
+                                        0.0           # size_y
+                                    )
                                 print(f"📡 [MAVLink] LANDING_TARGET 송출 -> angle_x: {math.degrees(angle_x):.2f}°, angle_y: {math.degrees(angle_y):.2f}°, Dist: {depth_value:.2f}m")
                             except Exception as mav_err:
                                 print(f"⚠️ MAVLink LANDING_TARGET 송신 실패: {mav_err}")
