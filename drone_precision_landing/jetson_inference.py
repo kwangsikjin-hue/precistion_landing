@@ -175,67 +175,71 @@ try:
                 if 0 <= cx < 640 and 0 <= cy < 480:
                     # 1단계: 마크 정중앙의 수직 깊이(Z고도) 거리 산출
                     depth_value = depth_frame.get_distance(cx, cy)
+                    if depth_value is None or depth_value < 0:
+                        depth_value = 0.0
+
+                    # 2단계: FOV 기반 정밀 착륙 방사각(angle_x, angle_y) 계산 (깊이가 없어도 2D 픽셀 기준으로 항상 선형 계산 가능!)
+                    dx = cx - intrinsics.ppx
+                    dy = cy - intrinsics.ppy
+                    angle_x = math.atan2(dx, intrinsics.fx)
+                    angle_y = math.atan2(dy, intrinsics.fy)
+
+                    # 3단계: 화면 표시 및 터미널 시각화 처리
+                    cv2.rectangle(color_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.circle(color_image, (cx, cy), 5, (0, 0, 255), -1)
 
                     if depth_value > 0:
-                        # 2단계: 🔥 [기하학 매핑] 2D 픽셀을 물리 미터(m) 단위의 3D 상대 좌표로 완벽 역산 변환
+                        # 3D 역산 복원
                         camera_3d_point = rs.rs2_deproject_pixel_to_point(intrinsics, [cx, cy], depth_value)
-
                         offset_x = camera_3d_point[0]  # 가로 오프셋 오차 (m)
                         offset_y = camera_3d_point[1]  # 세로 오프셋 오차 (m)
                         offset_z = camera_3d_point[2]  # 실제 수직 고도 (Z축 m)
-
-                        # 3단계: 모니터 화면 시각화 출력 (가로/세로 오프셋 실시간 박스 표기)
-                        cv2.rectangle(color_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        cv2.circle(color_image, (cx, cy), 5, (0, 0, 255), -1)
 
                         text_dist = f"Offset X: {offset_x:.2f}m, Y: {offset_y:.2f}m"
                         text_alt = f"Alt(Z): {offset_z:.2f}m"
                         cv2.putText(color_image, text_dist, (x1, y1 - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
                         cv2.putText(color_image, text_alt, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-                        # Jetson 터미널 로그 출력
+                        
                         print(f"🎯 패드 포착 -> 가로 오차: {offset_x*100:.1f}cm, 세로 오차: {offset_y*100:.1f}cm, 수직고도: {offset_z*100:.1f}cm")
+                    else:
+                        # 깊이 센서 미감지(최소 거리 이하 등) 시 각도만 화면에 표시
+                        cv2.putText(color_image, "Depth: N/A (Too Close/Far)", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                        print(f"🎯 패드 포착 (깊이 미확정) -> angle_x: {math.degrees(angle_x):.1f}°, angle_y: {math.degrees(angle_y):.1f}°")
 
-                        # 4단계: FOV 기반 정밀 착륙 방사각(angle_x, angle_y) 계산
-                        dx = cx - intrinsics.ppx
-                        dy = cy - intrinsics.ppy
-                        angle_x = math.atan2(dx, intrinsics.fx)
-                        angle_y = math.atan2(dy, intrinsics.fy)
-
-                        # 5단계: MAVLink LANDING_TARGET 메시지 송출 (10~30Hz 주기)
-                        if master is not None:
+                    # 4단계: MAVLink LANDING_TARGET 메시지 송출 (10~30Hz 주기 - 깊이가 0이어도 무조건 지속 전송!)
+                    if master is not None:
+                        try:
+                            tnow = int(time.time() * 1e6)
+                            frame = getattr(mavutil.mavlink, 'MAV_FRAME_BODY_NED', 8)
                             try:
-                                tnow = int(time.time() * 1e6)
-                                frame = getattr(mavutil.mavlink, 'MAV_FRAME_BODY_NED', 8)
-                                try:
-                                    # [방법 A] MAVLink 2 옵션 인자가 지원되는 최신 pymavlink 구문 시도
-                                    master.mav.landing_target_send(
-                                        time_usec=tnow,
-                                        target_num=0,
-                                        frame=frame,
-                                        angle_x=angle_x,
-                                        angle_y=angle_y,
-                                        distance=depth_value,
-                                        size_x=0.0,
-                                        size_y=0.0,
-                                        type=2,  # LANDING_TARGET_TYPE_VISION_FIDUCIAL
-                                        position_valid=0
-                                    )
-                                except TypeError:
-                                    # [방법 B] 구형 pymavlink (MAVLink 1 호환)인 경우 8개 기본 위치 인자만 전송
-                                    master.mav.landing_target_send(
-                                        tnow,         # time_usec
-                                        0,            # target_num
-                                        frame,        # frame
-                                        angle_x,      # angle_x
-                                        angle_y,      # angle_y
-                                        depth_value,  # distance
-                                        0.0,          # size_x
-                                        0.0           # size_y
-                                    )
-                                print(f"📡 [MAVLink] LANDING_TARGET 송출 -> angle_x: {math.degrees(angle_x):.2f}°, angle_y: {math.degrees(angle_y):.2f}°, Dist: {depth_value:.2f}m")
-                            except Exception as mav_err:
-                                print(f"⚠️ MAVLink LANDING_TARGET 송신 실패: {mav_err}")
+                                # [방법 A] MAVLink 2 옵션 인자가 지원되는 최신 pymavlink 구문 시도
+                                master.mav.landing_target_send(
+                                    time_usec=tnow,
+                                    target_num=0,
+                                    frame=frame,
+                                    angle_x=angle_x,
+                                    angle_y=angle_y,
+                                    distance=depth_value,
+                                    size_x=0.0,
+                                    size_y=0.0,
+                                    type=2,  # LANDING_TARGET_TYPE_VISION_FIDUCIAL
+                                    position_valid=0
+                                )
+                            except TypeError:
+                                # [방법 B] 구형 pymavlink (MAVLink 1 호환)인 경우 8개 기본 위치 인자만 전송
+                                master.mav.landing_target_send(
+                                    tnow,         # time_usec
+                                    0,            # target_num
+                                    frame,        # frame
+                                    angle_x,      # angle_x
+                                    angle_y,      # angle_y
+                                    depth_value,  # distance
+                                    0.0,          # size_x
+                                    0.0           # size_y
+                                )
+                            print(f"📡 [MAVLink] LANDING_TARGET 송출 -> angle_x: {math.degrees(angle_x):.2f}°, angle_y: {math.degrees(angle_y):.2f}°, Dist: {depth_value:.2f}m")
+                        except Exception as mav_err:
+                            print(f"⚠️ MAVLink LANDING_TARGET 송신 실패: {mav_err}")
 
         # --- [프레임 송신 및 로컬 화면 출력] ---
         
