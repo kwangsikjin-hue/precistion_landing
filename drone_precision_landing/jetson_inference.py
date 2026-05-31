@@ -194,6 +194,33 @@ try:
                         # Jetson 터미널 로그 출력
                         print(f"🎯 패드 포착 -> 가로 오차: {offset_x*100:.1f}cm, 세로 오차: {offset_y*100:.1f}cm, 수직고도: {offset_z*100:.1f}cm")
 
+                        # 4단계: FOV 기반 정밀 착륙 방사각(angle_x, angle_y) 계산
+                        dx = cx - intrinsics.ppx
+                        dy = cy - intrinsics.ppy
+                        angle_x = math.atan2(dx, intrinsics.fx)
+                        angle_y = math.atan2(dy, intrinsics.fy)
+
+                        # 5단계: MAVLink LANDING_TARGET 메시지 송출 (10~30Hz 주기)
+                        if master is not None:
+                            try:
+                                tnow = int(time.time() * 1e6)
+                                frame = getattr(mavutil.mavlink, 'MAV_FRAME_BODY_NED', 8)
+                                master.mav.landing_target_send(
+                                    time_usec=tnow,
+                                    target_num=0,
+                                    frame=frame,
+                                    angle_x=angle_x,
+                                    angle_y=angle_y,
+                                    distance=depth_value,
+                                    size_x=0.0,
+                                    size_y=0.0,
+                                    type=2,  # LANDING_TARGET_TYPE_VISION_FIDUCIAL
+                                    position_valid=0
+                                )
+                                print(f"📡 [MAVLink] LANDING_TARGET 송출 -> angle_x: {math.degrees(angle_x):.2f}°, angle_y: {math.degrees(angle_y):.2f}°, Dist: {depth_value:.2f}m")
+                            except Exception as mav_err:
+                                print(f"⚠️ MAVLink LANDING_TARGET 송신 실패: {mav_err}")
+
         # --- [프레임 송신 및 로컬 화면 출력] ---
         
         # 1. Mission Planner (PC)로 GStreamer 영상 송신 (명령줄 옵션이 on일 때만 작동)
