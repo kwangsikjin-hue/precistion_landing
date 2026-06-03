@@ -1227,10 +1227,14 @@ try:
                     lstm_pred.add(fx, fy, fz)
                     futures = lstm_pred.predict()
 
-                # [E5] ArUco 추적 중심 원 표시 (YOLO 경로와 시각 일관성)
+                # ArUco 추적 중심 원 표시
                 cv2.circle(color_image, (cx_a, cy_a), 7, (0, 255, 255), 2)
                 traj_log.update('ArUco', 0, fx, fy, fz, vx, vy, vz, speed)
-                draw_info(color_image, cx_a-80, cy_a+30,
+                # draw_info 고정 위치 (5, 93): YOLO/ByteTrack 경로와 동일한 위치
+                # 이전 (cx_a-80, cy_a+30)은 마커 위치에 따라 텍스트가 이동 →
+                # YOLO→ArUco 전환 시 텍스트가 "박스 아래 왼쪽으로 순간 이동"하는
+                # 원인이었음. 고정 위치로 변경하면 전환 시 텍스트 위치가 유지됨.
+                draw_info(color_image, 5, 93,
                           fx, fy, fz, vx, vy, vz, speed, (0,255,255))
                 cv2.putText(color_image,
                             f"SRC:ArUco|{single_kf.model_info}",
@@ -1274,9 +1278,10 @@ try:
                         lstm_pred.add(fx,fy,fz)
                         futures=lstm_pred.predict()
 
-                    # [E2] y1이 작으면(박스 상단 근처) draw_info가 SRC텍스트(y=20)와 겹침
-                    # y_top 최소 110 보장 → 첫 줄 y=55 이상, SRC(y=20)와 35px 간격
-                    draw_info(color_image,x1,max(y1,110),fx,fy,fz,vx,vy,vz,speed)
+                    # draw_info 고정 위치 (5, 93): ArUco/ByteTrack 경로와 통일
+                    # 이전 (x1, max(y1,110))은 바운딩박스 위치에 따라 텍스트 위치 변동
+                    # → ArUco↔YOLO 전환 시 텍스트 점프 현상의 또 다른 원인
+                    draw_info(color_image, 5, 93, fx, fy, fz, vx, vy, vz, speed)
                     cv2.putText(color_image,
                                 f"SRC:YOLO+D|{single_kf.model_info}",
                                 (5,20),cv2.FONT_HERSHEY_SIMPLEX,0.45,(200,200,200),1)
