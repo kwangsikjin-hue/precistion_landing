@@ -804,10 +804,14 @@ def project_to_pixel(fx, fy, fz):
     return (px,py) if 0<=px<640 and 0<=py<480 else None
 
 
+_color_cache: dict = {}   # tid → BGR 색상 캐시 (매 프레임 RandomState 생성 방지)
+
 def track_color(tid):
-    """트랙 ID → 고유 BGR 색상 (독립 RNG로 전역 난수 상태 오염 방지)"""
-    rng=np.random.RandomState(tid*17%256)
-    return tuple(int(c) for c in rng.randint(80,255,3))
+    """트랙 ID → 고유 BGR 색상 (결정론적, 캐싱으로 성능 개선)"""
+    if tid not in _color_cache:
+        rng = np.random.RandomState(tid * 17 % 256)
+        _color_cache[tid] = tuple(int(c) for c in rng.randint(80, 255, 3))
+    return _color_cache[tid]
 
 
 def draw_info(img, x1, y_top, fx, fy, fz, vx, vy, vz, speed, color=(255,255,0)):
@@ -880,9 +884,9 @@ try:
         color_image=np.asanyarray(color_frame.get_data()).copy()
 
         # ── [버그1 수정] YOLO는 반드시 그리기 전 깨끗한 이미지로 추론 ──
-        # ArUco가 color_image에 먼저 그린 뒤 YOLO를 실행하면
-        # YOLO가 그려진 선·박스를 착륙 패드로 오탐 → 중복 바운딩박스 발생
         # [M1] TensorRT 추론 → numpy 벡터화로 8400개 필터링
+        # 주의: infer()는 내부 host 버퍼의 View를 반환 → 다음 infer() 전 처리 완료 필수
+        # reshape·T 모두 View → all_dets 리스트 생성까지 버퍼 유효
         raw_out = trt_brain.infer(color_image).reshape(5, 8400).T  # (8400, 5)
 
         # ── ArUco 마커 탐지 (YOLO 추론 완료 후 그리기) ─────────────────
@@ -957,10 +961,18 @@ try:
             # ── 소스 1: ArUco (최우선 — 깊이 센서 불필요, 서브픽셀 정밀도) ──
             if aruco_pose is not None:
                 ax,ay,az,rvec,tvec,mid,cx_a,cy_a = aruco_pose
+                # az≈0 방어: DEPTH_MIN_M 미만이면 ArUco 포즈 신뢰 불가 → YOLO 폴백
+                if az < DEPTH_MIN_M:
+                    aruco_pose = None   # 이번 프레임은 ArUco 건너뜀
+
+            if aruco_pose is not None:
+                ax,ay,az,rvec,tvec,mid,cx_a,cy_a = aruco_pose
                 fx,fy,fz,vx,vy,vz,innov = single_kf.update(ax, ay, az)
                 speed   = math.sqrt(vx**2+vy**2+vz**2)
-                angle_x = math.atan2(fx, fz)
-                angle_y = math.atan2(fy, fz)
+                # fz≈0 방어: max로 0 나눗셈 방지
+                safe_fz = max(fz, 1e-4)
+                angle_x = math.atan2(fx, safe_fz)
+                angle_y = math.atan2(fy, safe_fz)
                 dv      = az   # ArUco 추정 거리 → MAVLink distance
 
                 if motp_eval: motp_eval.update(innov)
@@ -1098,10 +1110,12 @@ try:
                 if aruco_pose is not None and dv > 0:
                     ax,ay,az,_,_,mid,cx_a,cy_a = aruco_pose
                     pix_x = int(fx*intrinsics.fx/max(fz,0.01)+intrinsics.ppx)
-                    if abs(cx_a - pix_x) < 150:
+                    # az 하한 검증 추가 (az≈0 시 atan2 불안정 방지)
+                    if abs(cx_a - pix_x) < 150 and az >= DEPTH_MIN_M:
+                        safe_az = max(az, 1e-4)
                         # KF 이중 업데이트 없이 ArUco 각도만 교체
-                        angle_x = math.atan2(ax, az)
-                        angle_y = math.atan2(ay, az)
+                        angle_x = math.atan2(ax, safe_az)
+                        angle_y = math.atan2(ay, safe_az)
                         dv      = az
                         cv2.putText(color_image,
                                     f"ArUco refined ID:{mid}",
