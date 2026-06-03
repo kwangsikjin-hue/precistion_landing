@@ -367,9 +367,10 @@ class KFModelCTRV:
 
     @property
     def model_info(self):
+        # cv2.putText는 ASCII만 지원 — 한글 사용 시 ????? 표시
         if not self.initialized: return "CTRV"
-        yr=float(self.x[5])
-        m="직선" if abs(yr)<self._EPS else f"선회({math.degrees(yr):.1f}°/s)"
+        yr = float(self.x[5])
+        m = "Line" if abs(yr) < self._EPS else f"Turn({math.degrees(yr):.1f}d/s)"
         return f"CTRV[{m}]"
 
 
@@ -974,7 +975,7 @@ try:
                     track_3d_kfs[tid].reset(); del track_3d_kfs[tid]
 
             cv2.putText(color_image,
-                        f"ByteTrack | {args.model.upper()} | 활성:{len(active)}",
+                        f"ByteTrack | {args.model.upper()} | active:{len(active)}",
                         (5,20),cv2.FONT_HERSHEY_SIMPLEX,0.45,(200,200,200),1)
             if motp_eval:
                 cv2.putText(color_image,motp_eval.text(),
