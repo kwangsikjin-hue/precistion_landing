@@ -1116,7 +1116,13 @@ try:
         aruco_pose = None   # (ax, ay, az, rvec, tvec, marker_id, cx_a, cy_a)
 
         if _aruco_detect is not None:
-            gray_img = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+            # 그레이스케일 재사용 최적화:
+            # stabilize() 반환 후 _prev_gray = 현재 프레임 gray (모든 경로에서 갱신됨)
+            # EIS ON 시 이미 변환된 gray 재사용 → 이중 변환(300KB+1ms) 제거
+            if stabilizer is not None and stabilizer._prev_gray is not None:
+                gray_img = stabilizer._prev_gray   # 현재 프레임 gray 재사용
+            else:
+                gray_img = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
             corners, ids, _ = _aruco_detect(gray_img)
 
             if ids is not None and len(ids) > 0:
