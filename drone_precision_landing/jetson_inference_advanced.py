@@ -73,6 +73,19 @@ parser.add_argument('--mav', type=str, default='udpin:0.0.0.0:14551',
                          '  ※ udpout은 Jetson이 FC에 먼저 연결 → Heartbeat 빠름')
 parser.add_argument('--mav-timeout', type=int, default=3, metavar='SEC',
                     help='MAVLink Heartbeat 대기 타임아웃 초 (기본: 3)')
+parser.add_argument('--aruco', type=str, default='off', choices=['on', 'off'],
+                    help='ArUco 마커 탐지 활성화 (기본: off)\n'
+                         '  on: YOLO+depth보다 정밀한 자세 추정 병행\n'
+                         '  우선순위: ArUco > YOLO+depth > YOLO(FOV)')
+parser.add_argument('--aruco-dict', type=str, default='4X4_50',
+                    choices=['4X4_50','5X5_100','6X6_250','7X7_1000'],
+                    help='ArUco 사전 종류 (기본: 4X4_50)\n'
+                         '  4X4_50  : 작고 빠름, 근거리 적합\n'
+                         '  5X5_100 : 중간 거리\n'
+                         '  6X6_250 : 원거리, 더 많은 ID')
+parser.add_argument('--marker-size', type=float, default=0.5, metavar='M',
+                    help='ArUco 마커 실물 크기 미터 단위 (기본: 0.5m=50cm)\n'
+                         '  자세 추정 정확도에 직접 영향 — 실제 크기와 일치해야 함')
 args = parser.parse_args()
 
 ENABLE_STREAMING = (args.stream == 'on')
@@ -690,6 +703,46 @@ intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_i
 DEPTH_MIN_M = 0.15   # RealSense D435i 최소 신뢰 거리
 DEPTH_MAX_M = 8.0    # 정밀 착륙 유효 고도 상한
 
+# ─────────────────────────────────────────────────────────────────────
+# ArUco 마커 탐지기 초기화 (--aruco on 일 때만)
+# ─────────────────────────────────────────────────────────────────────
+_ARUCO_DICT_MAP = {
+    '4X4_50':   cv2.aruco.DICT_4X4_50,
+    '5X5_100':  cv2.aruco.DICT_5X5_100,
+    '6X6_250':  cv2.aruco.DICT_6X6_250,
+    '7X7_1000': cv2.aruco.DICT_7X7_1000,
+}
+MARKER_SIZE_M = args.marker_size   # 마커 실물 크기 (m)
+
+if args.aruco == 'on':
+    _adict  = cv2.aruco.getPredefinedDictionary(_ARUCO_DICT_MAP[args.aruco_dict])
+    _aparams = cv2.aruco.DetectorParameters()
+    # RealSense 내부 파라미터 → OpenCV 카메라 행렬
+    aruco_cam_mat = np.array([
+        [intrinsics.fx, 0,             intrinsics.ppx],
+        [0,             intrinsics.fy, intrinsics.ppy],
+        [0,             0,             1             ]
+    ], dtype=np.float64)
+    # RealSense D435i 왜곡 계수 (최소 왜곡, 보통 0에 가까움)
+    aruco_dist = np.array(intrinsics.coeffs, dtype=np.float64)
+
+    # OpenCV 버전 호환: 4.7+ ArucoDetector 클래스 / 구버전 detectMarkers 함수
+    try:
+        _aruco_detector = cv2.aruco.ArucoDetector(_adict, _aparams)
+        def _aruco_detect(gray):
+            return _aruco_detector.detectMarkers(gray)
+    except AttributeError:
+        def _aruco_detect(gray):
+            return cv2.aruco.detectMarkers(gray, _adict, parameters=_aparams)
+
+    print(f"✅ ArUco 탐지기 초기화 완료 "
+          f"(DICT_{args.aruco_dict}, 마커크기:{MARKER_SIZE_M*100:.0f}cm)")
+else:
+    _aruco_detect = None
+    aruco_cam_mat = None
+    aruco_dist    = None
+    print("ℹ️  ArUco 탐지 OFF (--aruco on 으로 활성화)")
+
 _startup_sec = time.time() - _startup_begin
 print(f"🚀 [성공] 전체 초기화 완료 — 총 소요시간: {_startup_sec:.1f}초")
 
@@ -806,6 +859,51 @@ try:
 
         color_image=np.asanyarray(color_frame.get_data())
 
+        # ── ArUco 마커 탐지 (YOLO와 독립 실행, --aruco on 시) ─────────
+        # 우선순위: ArUco > YOLO+depth > YOLO(FOV)
+        # ArUco tvec = 카메라 기준 3D 오프셋(m), 깊이 센서 불필요
+        aruco_pose = None   # (ax, ay, az, rvec, tvec, marker_id, cx_a, cy_a)
+
+        if _aruco_detect is not None:
+            gray_img = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+            corners, ids, _ = _aruco_detect(gray_img)
+
+            if ids is not None and len(ids) > 0:
+                # 모든 탐지 마커 윤곽선 그리기
+                cv2.aruco.drawDetectedMarkers(color_image, corners, ids)
+
+                # 가장 큰(가까운) 마커 선택
+                areas = [float(cv2.contourArea(c[0])) for c in corners]
+                bi    = int(np.argmax(areas))
+                c_pts = corners[bi][0]
+                mid   = int(ids[bi][0])
+                cx_a  = int(np.mean(c_pts[:, 0]))
+                cy_a  = int(np.mean(c_pts[:, 1]))
+
+                # 자세 추정 (Pose Estimation) — tvec=3D 오프셋(m)
+                rvec, tvec, _ = cv2.aruco.estimatePoseSingleMarkers(
+                    [corners[bi]], MARKER_SIZE_M, aruco_cam_mat, aruco_dist)
+                rvec = rvec[0]; tvec = tvec[0]
+
+                ax = float(tvec[0][0])  # 가로 오프셋 (m)
+                ay = float(tvec[0][1])  # 세로 오프셋 (m)
+                az = float(tvec[0][2])  # 거리(깊이) (m)
+
+                # 3D 좌표축 그리기 (빨강=X, 초록=Y, 파랑=Z)
+                try:
+                    cv2.drawFrameAxes(color_image, aruco_cam_mat, aruco_dist,
+                                      rvec, tvec, MARKER_SIZE_M * 0.4)
+                except AttributeError:
+                    cv2.aruco.drawAxis(color_image, aruco_cam_mat, aruco_dist,
+                                       rvec, tvec, MARKER_SIZE_M * 0.4)
+
+                # 마커 ID + 거리 표시 (황색)
+                cv2.putText(color_image, f"ArUco ID:{mid}  Z:{az:.2f}m",
+                            (cx_a - 60, cy_a - 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+
+                aruco_pose = (ax, ay, az, rvec, tvec, mid, cx_a, cy_a)
+
         # [M1] TensorRT 추론 → numpy 벡터화로 8400개 필터링
         # 원본: Python for 루프 8400회 → ~5~15ms 지연
         # 수정: numpy 마스킹+슬라이싱 → ~0.1ms
@@ -832,16 +930,50 @@ try:
             all_dets = []
 
         # ══════════════════════════════════════════════════════════════
-        # 모드 A: single — 최고 신뢰도 단일 객체
+        # 모드 A: single — 소스 우선순위: ArUco > YOLO+depth > YOLO(FOV)
         # ══════════════════════════════════════════════════════════════
         if args.tracker=='single':
             best=max(all_dets,key=lambda d:d[4]) if all_dets else None
 
-            if best and best[4]>=0.6:
+            # ── 소스 1: ArUco (최우선 — 깊이 센서 불필요, 서브픽셀 정밀도) ──
+            if aruco_pose is not None:
+                ax,ay,az,rvec,tvec,mid,cx_a,cy_a = aruco_pose
+                fx,fy,fz,vx,vy,vz,innov = single_kf.update(ax, ay, az)
+                speed   = math.sqrt(vx**2+vy**2+vz**2)
+                angle_x = math.atan2(fx, fz)
+                angle_y = math.atan2(fy, fz)
+                dv      = az   # ArUco 추정 거리 → MAVLink distance
+
+                if motp_eval: motp_eval.update(innov)
+                futures = None
+                if lstm_pred:
+                    lstm_pred.add(fx, fy, fz)
+                    futures = lstm_pred.predict()
+
+                draw_info(color_image, cx_a-80, cy_a+30,
+                          fx, fy, fz, vx, vy, vz, speed, (0,255,255))
+                cv2.putText(color_image,
+                            f"SRC:ArUco|{single_kf.model_info}",
+                            (5,20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,255), 1)
+
+                if futures:
+                    for k,(px_f,py_f,pz_f) in enumerate(futures):
+                        pix=project_to_pixel(px_f,py_f,pz_f)
+                        if pix:
+                            a=1.0-k/len(futures)
+                            cv2.circle(color_image,pix,max(2,int(5*a)),
+                                       (int(255*a),int(100*a),255),-1)
+
+                send_mavlink(angle_x, angle_y, dv)
+                print(f"🎯 [ArUco|{single_kf.model_info}] ID:{mid} "
+                      f"X:{fx*100:.1f} Y:{fy*100:.1f} Z:{fz*100:.1f}cm | "
+                      f"V:{speed*100:.1f}cm/s | innov:{innov*100:.2f}cm"
+                      +(f" | {motp_eval.text()}" if motp_eval else ""))
+
+            # ── 소스 2: YOLO + RealSense depth (ArUco 미탐지 시 폴백) ──
+            elif best and best[4]>=0.6:
                 x1,y1,x2,y2,score=best
                 cx,cy=(x1+x2)//2,(y1+y2)//2
-
-                # [C7 수정] cx,cy 클램프 → 경계 밖 검출도 FOV 각도 계산 및 MAVLink 송신
                 cx_c=max(0,min(639,cx)); cy_c=max(0,min(479,cy))
                 angle_x,angle_y=fov_angles(cx_c,cy_c)
                 dv=get_median_depth(depth_frame,cx_c,cy_c)
@@ -850,24 +982,20 @@ try:
                 cv2.circle(color_image,(cx_c,cy_c),5,(0,0,255),-1)
 
                 if DEPTH_MIN_M<dv<DEPTH_MAX_M:
-                    # 3D 역투영 + 칼만 필터
                     rx,ry,rz=rs.rs2_deproject_pixel_to_point(intrinsics,[cx_c,cy_c],dv)
                     fx,fy,fz,vx,vy,vz,innov=single_kf.update(rx,ry,rz)
                     speed=math.sqrt(vx**2+vy**2+vz**2)
-
-                    # 3D 기반 각도로 덮어쓰기 (더 정확)
                     angle_x=math.atan2(fx,fz); angle_y=math.atan2(fy,fz)
 
                     if motp_eval: motp_eval.update(innov)
-
-                    # LSTM
                     futures=None
                     if lstm_pred:
                         lstm_pred.add(fx,fy,fz)
                         futures=lstm_pred.predict()
 
                     draw_info(color_image,x1,y1,fx,fy,fz,vx,vy,vz,speed)
-                    cv2.putText(color_image,f"Model:{single_kf.model_info}",
+                    cv2.putText(color_image,
+                                f"SRC:YOLO+D|{single_kf.model_info}",
                                 (5,20),cv2.FONT_HERSHEY_SIMPLEX,0.45,(200,200,200),1)
 
                     if futures:
@@ -878,29 +1006,28 @@ try:
                                 cv2.circle(color_image,pix,max(2,int(5*a)),
                                            (int(255*a),int(100*a),255),-1)
 
-                    print(f"🎯 [{single_kf.model_info}] "
+                    print(f"🎯 [YOLO+D|{single_kf.model_info}] "
                           f"X:{fx*100:.1f} Y:{fy*100:.1f} Z:{fz*100:.1f}cm | "
                           f"V:{speed*100:.1f}cm/s | innov:{innov*100:.2f}cm"
                           +(f" | {motp_eval.text()}" if motp_eval else ""))
                 else:
-                    # 깊이 미확정 → FOV 각도만 표시 (원본 동작 보존)
                     cv2.putText(color_image,"Depth: N/A (Too Close/Far)",
                                 (x1,y1-10),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,255),2)
-                    print(f"🎯 패드 포착(깊이 미확정) -> "
-                          f"angle_x:{math.degrees(angle_x):.1f}° "
+                    print(f"🎯 [YOLO|FOV] angle_x:{math.degrees(angle_x):.1f}° "
                           f"angle_y:{math.degrees(angle_y):.1f}°")
                     single_kf.reset()
                     if lstm_pred: lstm_pred.reset()
 
-                # MAVLink: 깊이 있으면 3D 각도, 없으면 FOV 각도로 항상 송신
                 send_mavlink(angle_x,angle_y,dv)
 
-                if motp_eval:
-                    cv2.putText(color_image,motp_eval.text(),
-                                (5,470),cv2.FONT_HERSHEY_SIMPLEX,0.42,(180,255,180),1)
+            # ── 소스 없음 ──
             else:
                 single_kf.reset()
                 if lstm_pred: lstm_pred.reset()
+
+            if motp_eval:
+                cv2.putText(color_image,motp_eval.text(),
+                            (5,470),cv2.FONT_HERSHEY_SIMPLEX,0.42,(180,255,180),1)
 
         # ══════════════════════════════════════════════════════════════
         # 모드 B: bytetrack — 다중 객체 ByteTrack + 트랙별 3D KF
@@ -959,11 +1086,27 @@ try:
                                 cv2.circle(color_image,pix,max(2,int(5*a)),
                                            (int(255*a),int(100*a),255),-1)
 
+                # ArUco 탐지 시 주 트랙 위치에서 추가 정밀 보정
+                if aruco_pose is not None:
+                    ax,ay,az,_,_,mid,cx_a,cy_a = aruco_pose
+                    # 주 트랙 중심과 ArUco 중심이 150px 이내면 ArUco pose로 보정
+                    if abs(cx_a-int(fx*intrinsics.fx/max(fz,0.01)+intrinsics.ppx))<150:
+                        fx_a,fy_a,fz_a,vx,vy,vz,innov2 = \
+                            track_3d_kfs.get(ptid, single_kf).update(ax, ay, az)
+                        angle_x = math.atan2(fx_a, fz_a)
+                        angle_y = math.atan2(fy_a, fz_a)
+                        dv      = az
+                        cv2.putText(color_image,
+                                    f"ArUco refined ID:{mid}",
+                                    (cx_a-50, cy_a-40),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2)
+
                 send_mavlink(angle_x,angle_y,dv)
                 pos_str=(f"X:{fx*100:.1f} Y:{fy*100:.1f} Z:{fz*100:.1f}cm"
-                         if dv>0 else "깊이미확정(FOV각도로송신)")
-                print(f"[ByteTrack|{args.model.upper()}] 활성:{len(active)}개 | "
-                      f"주트랙ID:{ptid} score:{sc:.2f} | {pos_str}"
+                         if dv>0 else "Depth:N/A(FOV-angle)")
+                aruco_tag = f" ArUco:ID{aruco_pose[5]}" if aruco_pose else ""
+                print(f"[ByteTrack|{args.model.upper()}] active:{len(active)} | "
+                      f"track:{ptid} score:{sc:.2f} | {pos_str}{aruco_tag}"
                       +(f" | {motp_eval.text()}" if motp_eval else ""))
             else:
                 if lstm_pred: lstm_pred.reset()
