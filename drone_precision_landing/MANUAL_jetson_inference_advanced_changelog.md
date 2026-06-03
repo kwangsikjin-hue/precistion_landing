@@ -2,7 +2,7 @@
 
 **파일:** `drone_precision_landing/jetson_inference_advanced.py`  
 **원본:** `drone_precision_landing/jetson_inference.py`  
-**최종 커밋:** `e670f34`  
+**최종 커밋:** `9265db9`  
 **작성일:** 2026-06-03
 
 ---
@@ -31,8 +31,10 @@
 | `d630197` | fix | 2건 | `--stream on` 실행 시 get_distance() 타입 오류 수정 |
 | `b0a37ba` | perf | 5건 | 시작 지연 원인 개선 (진행 메시지·GPU 워밍업·타임아웃 단축) |
 | `e670f34` | feat | 2건 | `--mav`, `--mav-timeout` CLI 인수 추가 |
+| `2213c23` | fix | 2건 | `cv2.putText` 한글 → ASCII 교체 (`?????` 표시 수정) |
+| `9265db9` | feat | 6건 | ArUco 마커 탐지기 통합 (`--aruco`, `--aruco-dict`, `--marker-size`) |
 
-**총 수정·개선: 26건**
+**총 수정·개선: 34건**
 
 ---
 
@@ -538,6 +540,140 @@ parser.add_argument('--mav-timeout', type=int, default=3, metavar='SEC',
 
 ---
 
+### 커밋 `2213c23` — `cv2.putText` 한글 `?????` 표시 수정 (fix)
+
+#### 원인
+
+`cv2.putText()` + `FONT_HERSHEY_SIMPLEX`는 **ASCII(0~127)만 지원**합니다.  
+한글(유니코드 0xAC00~0xD7A3)을 전달하면 렌더링 불가 → `?????` 로 표시됩니다.
+
+#### 수정 위치 2곳
+
+| 위치 | 수정 전 | 수정 후 |
+|------|---------|---------|
+| `KFModelCTRV.model_info` | `CTRV[직선]` | `CTRV[Line]` |
+| `KFModelCTRV.model_info` | `CTRV[선회(15.3°/s)]` | `CTRV[Turn(15.3d/s)]` |
+| ByteTrack 오버레이 | `활성:{n}` | `active:{n}` |
+
+```python
+# 수정 전
+m = "직선" if abs(yr)<self._EPS else f"선회({math.degrees(yr):.1f}°/s)"
+
+# 수정 후 (ASCII만 사용)
+m = "Line" if abs(yr) < self._EPS else f"Turn({math.degrees(yr):.1f}d/s)"
+```
+
+---
+
+### 커밋 `9265db9` — ArUco 마커 탐지기 통합 (feat)
+
+#### ArUco 추가 배경
+
+사용 중인 마커(50cm×50cm ArUco 마커)를 cv2.aruco로 직접 탐지하면 YOLO+깊이 방식보다 더 정밀한 3D 위치를 얻을 수 있습니다.
+
+| 항목 | YOLO + RealSense depth | ArUco pose estimation |
+|------|----------------------|----------------------|
+| 중심 정밀도 | YOLO 박스 중심 (픽셀) | 4코너 평균 (서브픽셀) |
+| 깊이 센서 | 필요 | **불필요** |
+| 깊이 노이즈 영향 | 있음 | **없음** (기하학 계산) |
+| 마커 ID 확인 | 불가 | **가능** |
+| 6DOF 자세 | 부분적 | **완전** (roll/pitch/yaw) |
+
+#### 추가된 CLI 인수 3개
+
+```
+--aruco on/off        ArUco 탐지 활성화 (기본: off)
+--aruco-dict          사전 종류 (기본: 4X4_50)
+                        4X4_50   : 빠름, 근거리
+                        5X5_100  : 중간 거리
+                        6X6_250  : 원거리, ID 최대 250
+                        7X7_1000 : ID 최대 1000
+--marker-size         마커 실물 크기 미터 (기본: 0.5m=50cm)
+                      ※ 실제 마커와 반드시 일치해야 거리 추정 정확
+```
+
+#### 소스 우선순위 변경
+
+```
+[이전]
+  1순위: YOLO + RealSense depth
+  2순위: YOLO + FOV 각도 (depth 없을 때)
+
+[현재]
+  1순위: ArUco pose estimation  ← 신규 (깊이 센서 없이 tvec으로 3D 위치)
+  2순위: YOLO + RealSense depth ← 기존
+  3순위: YOLO + FOV 각도        ← 기존
+```
+
+#### ArUco 탐지 동작 원리
+
+```python
+# 1. 그레이스케일 변환 후 마커 탐지
+gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+corners, ids, _ = aruco_detector.detectMarkers(gray)
+
+# 2. 자세 추정 — tvec이 3D 오프셋(m) 직접 제공
+rvec, tvec, _ = cv2.aruco.estimatePoseSingleMarkers(
+    corners, MARKER_SIZE_M, camera_matrix, dist_coeffs)
+
+ax = tvec[0][0]   # 가로 오프셋 (m)
+ay = tvec[0][1]   # 세로 오프셋 (m)
+az = tvec[0][2]   # 거리/깊이   (m)
+
+# 3. 칼만 필터에 직접 입력 (YOLO 대체)
+fx, fy, fz, vx, vy, vz, innov = single_kf.update(ax, ay, az)
+```
+
+#### 화면 표시 항목 (--aruco on 시)
+
+```
+┌────────────────────────────────────────────────────┐
+│ SRC:ArUco|CTRV[Line]              (좌상단, 황색)   │
+│                                                    │
+│  ┌──────────────────┐                              │
+│  │  ←── X축(빨강)   │  ← 3D 좌표축 표시           │
+│  │  ↑ Y축(초록)     │                              │
+│  │  Z축(파랑)→      │                              │
+│  │  ArUco ID:0  Z:2.45m    (황색)                 │
+│  └──────────────────┘                              │
+│                                                    │
+│  Offset X:0.12m  Y:-0.05m   (노란색)              │
+│  Alt(Z): 2.45m              (초록색)              │
+│  Vel Vx:0.03 Vy:-0.01 ...  (하늘색)               │
+│  Speed:0.12m/s [12cm/s]     (파란색)              │
+└────────────────────────────────────────────────────┘
+```
+
+#### OpenCV 버전 호환 처리
+
+```python
+# 탐지 API (4.7+ ArucoDetector / 구버전 detectMarkers 자동 선택)
+try:
+    _aruco_detector = cv2.aruco.ArucoDetector(adict, aparams)
+    def _aruco_detect(gray): return _aruco_detector.detectMarkers(gray)
+except AttributeError:
+    def _aruco_detect(gray): return cv2.aruco.detectMarkers(gray, adict, ...)
+
+# 축 그리기 API (4.8+ drawFrameAxes / 구버전 drawAxis 자동 폴백)
+try:
+    cv2.drawFrameAxes(img, cam_mat, dist, rvec, tvec, size)
+except AttributeError:
+    cv2.aruco.drawAxis(img, cam_mat, dist, rvec, tvec, size)
+```
+
+#### ByteTrack 모드 ArUco 보정
+
+ByteTrack 모드에서는 주 트랙(highest score)의 중심과 ArUco 탐지 중심이 **150px 이내**일 때 추가 pose 보정을 적용합니다.
+
+```
+주 트랙 위치 (YOLO + depth)
+    + ArUco pose (150px 이내)
+    → 칼만 필터에 ArUco tvec 추가 보정
+    → "ArUco refined ID:N" 오버레이 표시
+```
+
+---
+
 ## 3. 카테고리별 수정 항목 전체 목록
 
 ### 🔴 런타임 크래시 방지 (7건)
@@ -572,12 +708,14 @@ parser.add_argument('--mav-timeout', type=int, default=3, metavar='SEC',
 | `B4` | `track_color()` `np.random.seed()` 전역 상태 오염 |
 | `B3` | `LSTMPredictor.predict()` `self.ref None` 안전장치 |
 
-### 🟢 코드 품질 (2건)
+### 🟢 코드 품질 (4건)
 
-| 항목 | 내용 |
-|------|------|
-| `C8` | `if True:` 제거 후 블록 들여쓰기 재정렬 |
-| `get_median_depth` | `int()` 캐스팅 안전망 추가 |
+| 항목 | 커밋 | 내용 |
+|------|------|------|
+| `C8` | `9baaeb8` | `if True:` 제거 후 블록 들여쓰기 재정렬 |
+| `get_median_depth` | `9baaeb8` | `int()` 캐스팅 안전망 추가 |
+| 한글→ASCII `2213c23` | `2213c23` | `CTRV[직선/선회]` → `CTRV[Line/Turn]`, `활성` → `active` |
+| 소스 표시 | `9265db9` | `SRC:ArUco`, `SRC:YOLO+D` 구분 출력 |
 
 ### 🔵 성능·UX 개선 (7건)
 
@@ -590,6 +728,17 @@ parser.add_argument('--mav-timeout', type=int, default=3, metavar='SEC',
 | `P5` | `b0a37ba` | 전체 초기화 총 소요시간 측정·출력 |
 | `E1` | `e670f34` | `--mav` 인수 추가 (연결 주소 자유 설정) |
 | `E2` | `e670f34` | `--mav-timeout` 인수 추가 (타임아웃 조절) |
+
+### 🟣 ArUco 마커 탐지 (6건)
+
+| 항목 | 커밋 | 내용 |
+|------|------|------|
+| `A1` | `9265db9` | `--aruco on/off` 인수 추가 |
+| `A2` | `9265db9` | `--aruco-dict` 사전 선택 인수 추가 |
+| `A3` | `9265db9` | `--marker-size` 실물 크기 인수 추가 (기본 0.5m) |
+| `A4` | `9265db9` | ArUco 소스 우선순위 1순위 적용 (tvec 직접 3D) |
+| `A5` | `9265db9` | 화면에 마커 ID·거리·3D 축 표시 |
+| `A6` | `9265db9` | ByteTrack 모드 ArUco 150px 이내 보정 |
 
 ---
 
@@ -618,6 +767,12 @@ parser.add_argument('--mav-timeout', type=int, default=3, metavar='SEC',
     │     ├── Innovation Norm 기반 실시간 MOTP 계산
     │     └── 종료 시 motp_log.csv 자동 저장
     │
+    ├── ArUco 마커 탐지 (--aruco on)
+    │     ├── cv2.aruco 탐지기 (4X4_50 / 5X5_100 / 6X6_250 / 7X7_1000)
+    │     ├── estimatePoseSingleMarkers → tvec 3D 위치 (깊이 센서 불필요)
+    │     ├── 마커 ID·거리·3D 좌표축 화면 표시
+    │     └── 소스 우선순위: ArUco > YOLO+depth > YOLO(FOV)
+    │
     └── 하드웨어 처리 개선
           ├── RealSense 깊이 필터 체인 (spatial→temporal→hole_fill)
           ├── 5×5 중앙값 깊이 측정 (단일 픽셀 → 노이즈 강건)
@@ -638,6 +793,9 @@ parser.add_argument('--mav-timeout', type=int, default=3, metavar='SEC',
 | `--motp` | 비활성 | MOTP 추적 정밀도 평가 플래그 |
 | `--mav` | `udpin:0.0.0.0:14551` | MAVLink 연결 주소 |
 | `--mav-timeout` | `3` | Heartbeat 대기 타임아웃 (초) |
+| `--aruco` | `off` | ArUco 마커 탐지 (`on` / `off`) |
+| `--aruco-dict` | `4X4_50` | ArUco 사전 (`4X4_50` / `5X5_100` / `6X6_250` / `7X7_1000`) |
+| `--marker-size` | `0.5` | 마커 실물 크기 미터 (현재 마커: 50cm×50cm) |
 
 ---
 
@@ -673,6 +831,18 @@ python3 jetson_inference_advanced.py \
     --stream on --model ctrv --tracker bytetrack \
     --predict 15 --motp \
     --mav udpout:192.168.0.10:14550 --mav-timeout 1
+
+# ArUco ON + CTRV 모델 (가장 정밀한 조합)
+python3 jetson_inference_advanced.py \
+    --aruco on --marker-size 0.5 \
+    --model ctrv --stream on \
+    --mav udpout:192.168.0.10:14550
+
+# ArUco + ByteTrack 다중 마커 환경
+python3 jetson_inference_advanced.py \
+    --aruco on --aruco-dict 6X6_250 --marker-size 0.5 \
+    --tracker bytetrack --model imm \
+    --stream on --motp
 ```
 
 ---
@@ -687,6 +857,9 @@ python3 jetson_inference_advanced.py \
 | MAVLink 재연결 없음 | 비행 중 연결 끊기면 복구 불가 | 추후 주기적 heartbeat 확인 로직 추가 필요 |
 | CTRV Joseph P 업데이트 | 수치 정밀도 향상되나 연산량 증가 | 고부하 시 `--model cv` 사용 권장 |
 | `--mav-timeout 0` | Heartbeat 없이 즉시 진행 | FC 없이 영상만 처리할 때만 사용 |
+| ArUco `--marker-size` 불일치 | 실물 크기와 다르면 거리 오차 발생 | 실제 마커 크기(0.5m) 정확히 입력 필수 |
+| ArUco + YOLO 동시 실행 | CPU 연산 약간 증가 | ArUco는 CPU 기반, GPU 부하 없음 |
+| ArUco 탐지 실패 시 | 조명·각도에 따라 인식률 저하 | YOLO+depth 자동 폴백 |
 | Windows IDE 모듈 오류 | cv2, pyrealsense2 등 Not Found 표시 | Jetson Nano 환경에서만 정상 실행됨 — Windows Python 환경 오탐 |
 
 ---
@@ -696,6 +869,8 @@ python3 jetson_inference_advanced.py \
 ```
 git log --oneline drone_precision_landing/jetson_inference_advanced.py
 
+9265db9 feat: ArUco 마커 탐지기 통합 (--aruco, --aruco-dict, --marker-size)
+2213c23 fix: cv2.putText 한글 렌더링 불가 → ????? 표시 수정
 e670f34 feat: MAVLink 연결 주소·타임아웃을 CLI 인수로 분리 (--mav, --mav-timeout)
 b0a37ba perf: 시작 지연 원인 개선 — 진행 메시지·워밍업·타임아웃 단축
 a810992 docs: jetson_inference_advanced.py 전체 수정 이력 매뉴얼 추가
@@ -711,4 +886,4 @@ a7e80b1 fix: ByteTrack 논리 버그 4건 및 안전성 개선 5건 수정
 
 ---
 
-*본 매뉴얼은 `jetson_inference_advanced.py` 커밋 `e670f34` 기준으로 작성되었습니다.*
+*본 매뉴얼은 `jetson_inference_advanced.py` 커밋 `9265db9` 기준으로 작성되었습니다.*
