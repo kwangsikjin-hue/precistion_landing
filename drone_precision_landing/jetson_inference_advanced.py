@@ -706,16 +706,30 @@ DEPTH_MAX_M = 8.0    # 정밀 착륙 유효 고도 상한
 # ─────────────────────────────────────────────────────────────────────
 # ArUco 마커 탐지기 초기화 (--aruco on 일 때만)
 # ─────────────────────────────────────────────────────────────────────
-_ARUCO_DICT_MAP = {
-    '4X4_50':   cv2.aruco.DICT_4X4_50,
-    '5X5_100':  cv2.aruco.DICT_5X5_100,
-    '6X6_250':  cv2.aruco.DICT_6X6_250,
-    '7X7_1000': cv2.aruco.DICT_7X7_1000,
-}
 MARKER_SIZE_M = args.marker_size   # 마커 실물 크기 (m)
 
-if args.aruco == 'on':
-    _adict  = cv2.aruco.getPredefinedDictionary(_ARUCO_DICT_MAP[args.aruco_dict])
+# cv2.aruco 모듈 가용 여부 사전 확인
+# 기본 opencv-python 에는 aruco 미포함 → contrib 패키지 필요
+_ARUCO_AVAILABLE = hasattr(cv2, 'aruco')
+
+if args.aruco == 'on' and not _ARUCO_AVAILABLE:
+    print("⚠️  cv2.aruco 모듈이 없습니다 — ArUco 기능을 비활성화합니다.")
+    print("     ArUco를 사용하려면 contrib 패키지를 설치하세요:")
+    print("     pip3 install opencv-contrib-python")
+    print("     (Jetson Nano에서는 소스 빌드 또는 JetPack 버전 확인 필요)")
+    _aruco_detect = None
+    aruco_cam_mat = None
+    aruco_dist    = None
+
+elif args.aruco == 'on' and _ARUCO_AVAILABLE:
+    # _ARUCO_DICT_MAP: cv2.aruco 존재 확인 후에만 참조
+    _ARUCO_DICT_MAP = {
+        '4X4_50':   cv2.aruco.DICT_4X4_50,
+        '5X5_100':  cv2.aruco.DICT_5X5_100,
+        '6X6_250':  cv2.aruco.DICT_6X6_250,
+        '7X7_1000': cv2.aruco.DICT_7X7_1000,
+    }
+    _adict   = cv2.aruco.getPredefinedDictionary(_ARUCO_DICT_MAP[args.aruco_dict])
     _aparams = cv2.aruco.DetectorParameters()
     # RealSense 내부 파라미터 → OpenCV 카메라 행렬
     aruco_cam_mat = np.array([
@@ -737,6 +751,7 @@ if args.aruco == 'on':
 
     print(f"✅ ArUco 탐지기 초기화 완료 "
           f"(DICT_{args.aruco_dict}, 마커크기:{MARKER_SIZE_M*100:.0f}cm)")
+
 else:
     _aruco_detect = None
     aruco_cam_mat = None
