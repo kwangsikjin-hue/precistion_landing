@@ -103,9 +103,14 @@ parser.add_argument('--aruco-dict', type=str, default='4X4_50',
 parser.add_argument('--marker-size', type=float, default=0.5, metavar='M',
                     help='ArUco 마커 실물 크기 미터 단위 (기본: 0.5m=50cm)\n'
                          '  자세 추정 정확도에 직접 영향 — 실제 크기와 일치해야 함')
+parser.add_argument('--verbose', type=str, default='off', choices=['on', 'off'],
+                    help='루프 내 print 출력 여부 (기본: off)\n'
+                         '  off: 루프 print 제거 → CPU/I-O 절약 → 30fps 유지에 유리\n'
+                         '  on : 매 프레임 탐지·MAVLink 결과 출력 (디버그용)')
 args = parser.parse_args()
 
 ENABLE_STREAMING = (args.stream == 'on')
+VERBOSE = (args.verbose == 'on')   # 루프 내 print 제어 플래그
 print(f"[설정] 스트리밍={args.stream} | 모델={args.model.upper()} | "
       f"추적={args.tracker} | LSTM={args.predict}스텝 | MOTP={args.motp} | "
       f"MAVLink={args.mav}")
@@ -1070,11 +1075,12 @@ def send_mavlink(angle_x, angle_y, distance):
         # [C2 수정] MAVLink2 전송 중 네트워크/소켓 예외 처리
         print(f"⚠️ MAVLink 송신 실패 (MAVLink2): {mav_err}")
         return
-    # 송신 성공 시 각도/거리 출력
-    print(f"📡 [MAVLink] LANDING_TARGET 송출 -> "
-          f"angle_x:{math.degrees(angle_x):.2f}°, "
-          f"angle_y:{math.degrees(angle_y):.2f}°, "
-          f"Dist:{distance:.2f}m")
+    # 송신 성공 시 각도/거리 출력 (--verbose on 시만)
+    if VERBOSE:
+        print(f"📡 [MAVLink] LANDING_TARGET 송출 -> "
+              f"angle_x:{math.degrees(angle_x):.2f}°, "
+              f"angle_y:{math.degrees(angle_y):.2f}°, "
+              f"Dist:{distance:.2f}m")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1241,10 +1247,11 @@ try:
                                        (int(255*a),int(100*a),255),-1)
 
                 send_mavlink(angle_x, angle_y, dv)
-                print(f"🎯 [ArUco|{single_kf.model_info}] ID:{mid} "
-                      f"X:{fx*100:.1f} Y:{fy*100:.1f} Z:{fz*100:.1f}cm | "
-                      f"V:{speed*100:.1f}cm/s | innov:{innov*100:.2f}cm"
-                      +(f" | {motp_eval.text()}" if motp_eval else ""))
+                if VERBOSE:
+                    print(f"🎯 [ArUco|{single_kf.model_info}] ID:{mid} "
+                          f"X:{fx*100:.1f} Y:{fy*100:.1f} Z:{fz*100:.1f}cm | "
+                          f"V:{speed*100:.1f}cm/s | innov:{innov*100:.2f}cm"
+                          +(f" | {motp_eval.text()}" if motp_eval else ""))
 
             # ── 소스 2: YOLO + RealSense depth (ArUco 미탐지 시 폴백) ──
             elif best and best[4]>=0.6:
@@ -1286,15 +1293,17 @@ try:
                                 cv2.circle(color_image,pix,max(2,int(5*a)),
                                            (int(255*a),int(100*a),255),-1)
 
-                    print(f"🎯 [YOLO+D|{single_kf.model_info}] "
-                          f"X:{fx*100:.1f} Y:{fy*100:.1f} Z:{fz*100:.1f}cm | "
-                          f"V:{speed*100:.1f}cm/s | innov:{innov*100:.2f}cm"
-                          +(f" | {motp_eval.text()}" if motp_eval else ""))
+                    if VERBOSE:
+                        print(f"🎯 [YOLO+D|{single_kf.model_info}] "
+                              f"X:{fx*100:.1f} Y:{fy*100:.1f} Z:{fz*100:.1f}cm | "
+                              f"V:{speed*100:.1f}cm/s | innov:{innov*100:.2f}cm"
+                              +(f" | {motp_eval.text()}" if motp_eval else ""))
                 else:
                     cv2.putText(color_image,"Depth: N/A (Too Close/Far)",
                                 (x1,y1-10),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,255),2)
-                    print(f"🎯 [YOLO|FOV] angle_x:{math.degrees(angle_x):.1f}° "
-                          f"angle_y:{math.degrees(angle_y):.1f}°")
+                    if VERBOSE:
+                        print(f"🎯 [YOLO|FOV] angle_x:{math.degrees(angle_x):.1f}° "
+                              f"angle_y:{math.degrees(angle_y):.1f}°")
                     single_kf.reset()
                     if lstm_pred: lstm_pred.reset()
 
@@ -1398,12 +1407,13 @@ try:
                                            (int(255*a),int(100*a),255),-1)
 
                 send_mavlink(angle_x,angle_y,dv)
-                pos_str=(f"X:{fx*100:.1f} Y:{fy*100:.1f} Z:{fz*100:.1f}cm"
-                         if dv>0 else "Depth:N/A(FOV-angle)")
-                aruco_tag = f" ArUco:ID{aruco_pose[5]}" if aruco_pose else ""
-                print(f"[ByteTrack|{args.model.upper()}] active:{len(active)} | "
-                      f"track:{ptid} score:{sc:.2f} | {pos_str}{aruco_tag}"
-                      +(f" | {motp_eval.text()}" if motp_eval else ""))
+                if VERBOSE:
+                    pos_str=(f"X:{fx*100:.1f} Y:{fy*100:.1f} Z:{fz*100:.1f}cm"
+                             if dv>0 else "Depth:N/A(FOV-angle)")
+                    aruco_tag = f" ArUco:ID{aruco_pose[5]}" if aruco_pose else ""
+                    print(f"[ByteTrack|{args.model.upper()}] active:{len(active)} | "
+                          f"track:{ptid} score:{sc:.2f} | {pos_str}{aruco_tag}"
+                          +(f" | {motp_eval.text()}" if motp_eval else ""))
             else:
                 if lstm_pred: lstm_pred.reset()
 
