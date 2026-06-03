@@ -837,6 +837,7 @@ byte_tracker = ByteTracker(match_thresh=0.7, max_lost=15) if args.tracker=='byte
 track_3d_kfs = {}   # {track_id: KFModel3D}
 
 lstm_pred = LSTMPredictor(args.predict) if args.predict>0 else None
+_lstm_primary_id = None   # [E1] 이전 주 트랙 ID 추적 → 변경 시 LSTM 리셋
 # save_log=True → 처음부터 _log 누적 / False → _log 비활성, 마지막 저장도 없음
 motp_eval = MOTPEvaluator(save_log=(args.motp_log == 'on')) if args.motp else None
 # save_log=True 이면 처음부터 누적 / False 이면 리스트 미생성, update() 즉시 반환
@@ -1057,6 +1058,8 @@ try:
                     lstm_pred.add(fx, fy, fz)
                     futures = lstm_pred.predict()
 
+                # [E5] ArUco 추적 중심 원 표시 (YOLO 경로와 시각 일관성)
+                cv2.circle(color_image, (cx_a, cy_a), 7, (0, 255, 255), 2)
                 traj_log.update('ArUco', 0, fx, fy, fz, vx, vy, vz, speed)
                 draw_info(color_image, cx_a-80, cy_a+30,
                           fx, fy, fz, vx, vy, vz, speed, (0,255,255))
@@ -1102,7 +1105,9 @@ try:
                         lstm_pred.add(fx,fy,fz)
                         futures=lstm_pred.predict()
 
-                    draw_info(color_image,x1,y1,fx,fy,fz,vx,vy,vz,speed)
+                    # [E2] y1이 작으면(박스 상단 근처) draw_info가 SRC텍스트(y=20)와 겹침
+                    # y_top 최소 110 보장 → 첫 줄 y=55 이상, SRC(y=20)와 35px 간격
+                    draw_info(color_image,x1,max(y1,110),fx,fy,fz,vx,vy,vz,speed)
                     cv2.putText(color_image,
                                 f"SRC:YOLO+D|{single_kf.model_info}",
                                 (5,20),cv2.FONT_HERSHEY_SIMPLEX,0.45,(200,200,200),1)
@@ -1181,6 +1186,7 @@ try:
                         primary=(track.score,tid,0,0,0,0,0,0,0,angle_x,angle_y,0.0)
 
             if primary:
+                # [E4] angle_x/y는 primary 튜플에서 가져옴 (루프 마지막 트랙 값 아님)
                 sc,ptid,fx,fy,fz,vx,vy,vz,innov,angle_x,angle_y,dv=primary
 
                 # [버그3 수정] ArUco 보정: for 루프에서 이미 업데이트된 트랙 KF를
@@ -1210,7 +1216,11 @@ try:
                     draw_info(color_image, 5, 93, fx, fy, fz, vx, vy, vz, speed_p, col_p)
 
                 # LSTM — 주 트랙만 적용
+                # [E1] 주 트랙 ID 변경 시 LSTM 버퍼 리셋 (다른 트랙 궤적 혼입 방지)
                 if lstm_pred and dv>0:
+                    if ptid != _lstm_primary_id:   # 모듈 스코프 변수, global 불필요
+                        lstm_pred.reset()
+                        _lstm_primary_id = ptid
                     lstm_pred.add(fx,fy,fz)
                     futures=lstm_pred.predict()
                     if futures:
@@ -1231,11 +1241,13 @@ try:
             else:
                 if lstm_pred: lstm_pred.reset()
 
-            # 소멸 트랙 3D KF 정리
+            # 소멸 트랙 3D KF + 색상 캐시 정리
+            # [E3] _color_cache는 트랙 ID 단조 증가로 영구 누적 → 소멸 트랙과 함께 제거
             active_ids={t.track_id for t in active}
             for tid in list(track_3d_kfs):
                 if tid not in active_ids:
                     track_3d_kfs[tid].reset(); del track_3d_kfs[tid]
+                    _color_cache.pop(tid, None)   # 색상 캐시도 함께 제거
 
             cv2.putText(color_image,
                         f"ByteTrack | {args.model.upper()} | active:{len(active)}",
