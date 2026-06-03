@@ -1126,9 +1126,6 @@ try:
             corners, ids, _ = _aruco_detect(gray_img)
 
             if ids is not None and len(ids) > 0:
-                # 모든 탐지 마커 윤곽선 그리기 (YOLO 추론 후 안전)
-                cv2.aruco.drawDetectedMarkers(color_image, corners, ids)
-
                 # 가장 큰(가까운) 마커 선택
                 areas = [float(cv2.contourArea(c[0])) for c in corners]
                 bi    = int(np.argmax(areas))
@@ -1146,20 +1143,32 @@ try:
                 ay = float(tvec[0][1])  # 세로 오프셋 (m)
                 az = float(tvec[0][2])  # 거리(깊이) (m)
 
-                # 3D 좌표축 그리기 (빨강=X, 초록=Y, 파랑=Z)
-                try:
-                    cv2.drawFrameAxes(color_image, aruco_cam_mat, aruco_dist,
-                                      rvec, tvec, MARKER_SIZE_M * 0.4)
-                except AttributeError:
-                    cv2.aruco.drawAxis(color_image, aruco_cam_mat, aruco_dist,
-                                       rvec, tvec, MARKER_SIZE_M * 0.4)
-
-                # 마커 ID + 거리 표시 (황색)
-                cv2.putText(color_image, f"ArUco ID:{mid}  Z:{az:.2f}m",
-                            (cx_a - 60, cy_a - 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
-
-                aruco_pose = (ax, ay, az, rvec, tvec, mid, cx_a, cy_a)
+                # ── az 유효성 체크를 그리기 전에 먼저 수행 ──────────────
+                # 기존 버그: drawDetectedMarkers·drawFrameAxes·황색 텍스트를
+                #   az 체크 전에 그린 후 → 나중에 aruco_pose=None 처리
+                #   → YOLO 텍스트(녹/주/파)와 ArUco 텍스트(황)가 동시 표시됨
+                if az >= DEPTH_MIN_M:
+                    # az 유효: 마커 윤곽·3D 축·ID 텍스트 모두 표시
+                    cv2.aruco.drawDetectedMarkers(color_image, corners, ids)
+                    try:
+                        cv2.drawFrameAxes(color_image, aruco_cam_mat, aruco_dist,
+                                          rvec, tvec, MARKER_SIZE_M * 0.4)
+                    except AttributeError:
+                        cv2.aruco.drawAxis(color_image, aruco_cam_mat, aruco_dist,
+                                           rvec, tvec, MARKER_SIZE_M * 0.4)
+                    # 황색 ID 텍스트 — az 유효할 때만 표시
+                    cv2.putText(color_image, f"ArUco ID:{mid}  Z:{az:.2f}m",
+                                (cx_a - 60, cy_a - 20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+                    aruco_pose = (ax, ay, az, rvec, tvec, mid, cx_a, cy_a)
+                else:
+                    # az 무효 (너무 가깝거나 신뢰 불가): 경고 텍스트만 표시
+                    # YOLO 경로가 실행되도록 aruco_pose는 None 유지
+                    cv2.aruco.drawDetectedMarkers(color_image, corners, ids)
+                    cv2.putText(color_image,
+                                f"ArUco ID:{mid}  Z:N/A(<{DEPTH_MIN_M*100:.0f}cm)",
+                                (cx_a - 60, cy_a - 20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 100, 255), 1)
         scores  = raw_out[:, 4]
         vmask   = scores >= 0.3          # ByteTrack 저신뢰도 포함 최소 임계값
         vpreds  = raw_out[vmask]         # (N, 5) — score 0.3 이상 박스만
@@ -1197,12 +1206,8 @@ try:
             best=max(all_dets,key=lambda d:d[4]) if all_dets else None
 
             # ── 소스 1: ArUco (최우선 — 깊이 센서 불필요, 서브픽셀 정밀도) ──
-            if aruco_pose is not None:
-                ax,ay,az,rvec,tvec,mid,cx_a,cy_a = aruco_pose
-                # az≈0 방어: DEPTH_MIN_M 미만이면 ArUco 포즈 신뢰 불가 → YOLO 폴백
-                if az < DEPTH_MIN_M:
-                    aruco_pose = None   # 이번 프레임은 ArUco 건너뜀
-
+            # az 유효성 체크는 탐지 블록에서 이미 완료됨
+            # (az < DEPTH_MIN_M 이면 aruco_pose=None으로 설정 안 됨)
             if aruco_pose is not None:
                 ax,ay,az,rvec,tvec,mid,cx_a,cy_a = aruco_pose
                 fx,fy,fz,vx,vy,vz,innov = single_kf.update(ax, ay, az)
