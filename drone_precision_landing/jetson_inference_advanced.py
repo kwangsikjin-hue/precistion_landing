@@ -75,7 +75,7 @@ print(f"[설정] 스트리밍={args.stream} | 모델={args.model.upper()} | "
 # GStreamer 스트리밍 초기화
 # ─────────────────────────────────────────────────────────────────────
 if ENABLE_STREAMING:
-    print("📡 [알림] GStreamer UDP 스트리밍 모드 ON (Target: 192.168.0.30:15600)")
+    print("📡 [알림] GStreamer UDP 스트리밍 초기화 중... (x264enc 로딩, 2~5초 소요)")
     gst_pipeline = (
         "appsrc ! "
         "videoconvert ! "
@@ -90,6 +90,8 @@ if ENABLE_STREAMING:
     if not out.isOpened():
         print("⚠️ GStreamer 초기화 실패 — 스트리밍 없이 계속합니다.")
         out = None
+    else:
+        print("✅ GStreamer 스트리밍 초기화 완료 (Target: 192.168.0.30:15600)")
 else:
     print("🖥️  [알림] GStreamer 스트리밍 OFF (로컬 화면만 표시)")
     out = None
@@ -98,15 +100,15 @@ else:
 # MAVLink 비행 제어기 연결
 # ─────────────────────────────────────────────────────────────────────
 try:
-    print("⏳ MAVLink 연결 시도 중...")
-    # udpin:0.0.0.0:14551 — 모든 네트워크 인터페이스에서 수신 대기
+    # timeout=3으로 단축 (원본 5초 → 3초, FC 미연결 시 대기 시간 감소)
+    print("⏳ MAVLink 연결 시도 중... (최대 3초 대기)")
     master = mavutil.mavlink_connection('udpin:0.0.0.0:14551')
-    msg = master.recv_match(type='HEARTBEAT', blocking=True, timeout=5)
+    msg = master.recv_match(type='HEARTBEAT', blocking=True, timeout=3)
     if msg:
         print("🛸 [성공] ArduPilot FC MAVLink 연결 완료!")
     else:
-        # [M4] 타임아웃 시 master=None — 원본은 master 객체가 남아 의미없는 패킷을 계속 송신
-        print("⚠️ [경고] 5초간 Heartbeat 없음 — master=None 처리 후 영상 처리만 진행합니다.")
+        # [M4] 타임아웃 시 master=None
+        print("⚠️ [경고] 3초간 Heartbeat 없음 — master=None 처리 후 영상 처리만 진행합니다.")
         master = None
 except Exception as e:
     print(f"⚠️ FC 연결 실패: {e}")
@@ -123,9 +125,13 @@ class JetsonTRTEngine:
     def __init__(self, engine_path):
         self.logger = trt.Logger(trt.Logger.WARNING)
         trt.init_libnvinfer_plugins(self.logger, "")
+        # TensorRT 역직렬화 — Jetson Nano에서 5~20초 소요, 진행 메시지 표시
+        print(f"⏳ TensorRT 엔진 로딩 중: {engine_path} (5~20초 소요, 잠시 대기)")
+        t0 = time.time()
         with open(engine_path, "rb") as f, trt.Runtime(self.logger) as runtime:
             self.engine = runtime.deserialize_cuda_engine(f.read())
         self.context  = self.engine.create_execution_context()
+        print(f"✅ TensorRT 엔진 로드 완료 ({time.time()-t0:.1f}초)")
         self.cuda_lib = ctypes.CDLL("/usr/local/cuda/lib64/libcudart.so")
         self.inputs, self.outputs, self.bindings, self._ptrs = [], [], [], []
 
@@ -640,29 +646,43 @@ class MOTPEvaluator:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# [6] 하드웨어 초기화
+# [6] 하드웨어 초기화 (전체 시작 시간 측정)
 # ─────────────────────────────────────────────────────────────────────
-trt_brain=JetsonTRTEngine('best.engine')
+_startup_begin = time.time()
 
-pipeline=rs.pipeline()
-config=rs.config()
-config.enable_stream(rs.stream.depth,640,480,rs.format.z16,30)
-config.enable_stream(rs.stream.color,640,480,rs.format.bgr8,30)
-profile=pipeline.start(config)
-align=rs.align(rs.stream.color)
+# TensorRT 엔진 로드 (내부에서 진행 메시지 출력)
+trt_brain = JetsonTRTEngine('best.engine')
+
+# GPU 워밍업 — 첫 번째 실제 추론의 JIT 컴파일 지연 제거
+# 빈 더미 이미지로 1회 추론 → GPU 커널 사전 컴파일
+print("⏳ GPU 워밍업 중 (첫 프레임 지연 제거)...")
+_dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+trt_brain.infer(_dummy)
+print("✅ GPU 워밍업 완료")
+
+# RealSense 파이프라인 시작 (USB 장치 열거 + 센서 초기화, 1~3초 소요)
+print("⏳ RealSense D435i 초기화 중...")
+pipeline = rs.pipeline()
+config   = rs.config()
+config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16,  30)
+config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+profile  = pipeline.start(config)
+align    = rs.align(rs.stream.color)
+print("✅ RealSense 초기화 완료")
 
 # 깊이 후처리 필터 체인
-spatial_filter=rs.spatial_filter()
-temporal_filter=rs.temporal_filter()
-hole_fill=rs.hole_filling_filter()
+spatial_filter  = rs.spatial_filter()
+temporal_filter = rs.temporal_filter()
+hole_fill       = rs.hole_filling_filter()
 
 # intrinsics: 세션 중 불변 → 루프 밖에서 1회만 취득
-intrinsics=profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
 
-DEPTH_MIN_M=0.15    # RealSense D435i 최소 신뢰 거리
-DEPTH_MAX_M=8.0     # 정밀 착륙 유효 고도 상한
+DEPTH_MIN_M = 0.15   # RealSense D435i 최소 신뢰 거리
+DEPTH_MAX_M = 8.0    # 정밀 착륙 유효 고도 상한
 
-print("🚀 [성공] AI 추론 엔진 및 리얼센스 파이프라인 가동 완료.")
+_startup_sec = time.time() - _startup_begin
+print(f"🚀 [성공] 전체 초기화 완료 — 총 소요시간: {_startup_sec:.1f}초")
 
 # ─────────────────────────────────────────────────────────────────────
 # [7] 인스턴스 생성
