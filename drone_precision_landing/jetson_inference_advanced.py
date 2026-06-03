@@ -65,6 +65,10 @@ parser.add_argument('--predict', type=int, default=0, metavar='N',
                     help='LSTM 미래 위치 예측 스텝 수 (0=비활성)')
 parser.add_argument('--motp', action='store_true',
                     help='MOTP 추적 정밀도 평가 활성화')
+parser.add_argument('--motp-log', type=str, default='on', choices=['on', 'off'],
+                    help='MOTP 결과 CSV 파일 저장 여부 (기본: on)\n'
+                         '  on : 종료 시 motp_log.csv 자동 저장\n'
+                         '  off: 화면 표시만, 파일 저장 안 함')
 parser.add_argument('--mav', type=str, default='udpin:0.0.0.0:14551',
                     help='MAVLink 연결 주소 (기본: udpin:0.0.0.0:14551)\n'
                          '  예) SITL PC:       --mav udpout:192.168.0.10:14550\n'
@@ -872,7 +876,9 @@ try:
         depth_frame=temporal_filter.process(depth_frame).as_depth_frame()
         depth_frame=hole_fill.process(depth_frame).as_depth_frame()
 
-        color_image=np.asanyarray(color_frame.get_data())
+        # .copy() 필수: asanyarray는 RealSense 내부 버퍼의 View를 반환
+        # copy 없이 그리면 버퍼가 오염 → 다음 프레임에 잔상·중복 발생
+        color_image=np.asanyarray(color_frame.get_data()).copy()
 
         # ── ArUco 마커 탐지 (YOLO와 독립 실행, --aruco on 시) ─────────
         # 우선순위: ArUco > YOLO+depth > YOLO(FOV)
@@ -1157,8 +1163,11 @@ except Exception as e:
 finally:
     print("시스템 자원을 해제합니다...")
     if motp_eval and motp_eval.total_c>0:
-        motp_eval.save()
         print(f"📊 최종 {motp_eval.text()}")
+        if args.motp_log == 'on':
+            motp_eval.save()   # motp_log.csv 저장
+        else:
+            print("ℹ️  MOTP CSV 저장 skipped (--motp-log off)")
     pipeline.stop()
     cv2.destroyAllWindows()
     if ENABLE_STREAMING and out is not None and out.isOpened():
