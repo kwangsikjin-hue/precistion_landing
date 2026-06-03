@@ -323,9 +323,19 @@ class KFModelCTRV:
         innov_vec=meas-self.H@x_pred
         innov=float(np.linalg.norm(innov_vec))
         S=self.H@P_pred@self.H.T+self.R
-        K=P_pred@self.H.T@np.linalg.inv(S)
+        try:
+            # [C3 수정] S 특이행렬 보호 — inv 대신 solve 사용 (수치 안정성↑)
+            K=P_pred@self.H.T@np.linalg.solve(S.T,np.eye(self.m)).T
+        except np.linalg.LinAlgError:
+            # S가 특이행렬이면 예측값만 유지하고 보정 건너뜀
+            self.x=x_pred; self.P=P_pred
+            fx,fy,fz=float(x_pred[0]),float(x_pred[1]),float(x_pred[2])
+            v=float(x_pred[3]); yaw=float(x_pred[4]); vz=float(x_pred[6])
+            return fx,fy,fz,v*math.cos(yaw),v*math.sin(yaw),vz,innov
         self.x=x_pred+K@innov_vec
-        self.P=(np.eye(7)-K@self.H)@P_pred
+        # [C3 추가] Joseph 형식 — 수치 오차로 P가 음정치(negative definite) 되는 것 방지
+        IKH=np.eye(7)-K@self.H
+        self.P=IKH@P_pred@IKH.T+K@self.R@K.T
         self.x[4,0]=math.atan2(math.sin(self.x[4,0]),math.cos(self.x[4,0]))
         fx=float(self.x[0]); fy=float(self.x[1]); fz=float(self.x[2])
         v=float(self.x[3]); yaw=float(self.x[4]); vz=float(self.x[6])
@@ -406,10 +416,17 @@ class KalmanBoxFilter:
         return F@mean, F@cov@F.T+np.diag(np.square(std))
 
     def update(self, mean, cov, meas):
-        h=mean[3]
+        h=max(mean[3], 1.0)  # [C4 수정] h≈0 방지 → R/S 특이행렬 예방
         R=np.diag(np.square([self._W_POS*h,self._W_POS*h,1e-1,self._W_POS*h]))
-        H=np.eye(4,8); S=H@cov@H.T+R; K=cov@H.T@np.linalg.inv(S)
-        return mean+K@(meas-H@mean), (np.eye(8)-K@H)@cov
+        H=np.eye(4,8); S=H@cov@H.T+R
+        try:
+            K=cov@H.T@np.linalg.solve(S.T,np.eye(4)).T
+        except np.linalg.LinAlgError:
+            return mean, cov  # S 특이행렬이면 업데이트 건너뜀
+        new_mean=mean+K@(meas-H@mean)
+        IKH=np.eye(8)-K@H
+        new_cov=IKH@cov@IKH.T+K@R@K.T  # Joseph 형식
+        return new_mean, new_cov
 
 
 class STrack:
@@ -564,8 +581,13 @@ class LSTMPredictor:
         if not xs: return
         X,Y=torch.tensor(np.stack(xs)),torch.tensor(np.stack(ys))
         self.net.train()
+        # [C6] 메인루프 블로킹 학습 — 소요시간 측정 후 경고
+        t0=time.time()
         for _ in range(self.EPOCHS):
             self.opt.zero_grad(); loss=self.crit(self.net(X),Y); loss.backward(); self.opt.step()
+        elapsed=(time.time()-t0)*1000
+        if elapsed>50:
+            print(f"⚠️ [LSTM] 학습 {elapsed:.0f}ms — 프레임 드롭 주의 (EPOCHS 줄이기 권장)")
 
     def predict(self):
         if len(self.buf)<self.SEQ_LEN or self.ref is None: return None
@@ -591,9 +613,14 @@ class MOTPEvaluator:
     def __init__(self):
         self.total_d=0.0; self.total_c=0; self.frame=0; self._log=[]
 
+    _LOG_MAX=18000  # 최대 보관 항목 수 (30fps×10분=18000)
+
     def update(self, innov):
         self.total_d+=innov; self.total_c+=1; self.frame+=1
         self._log.append((self.frame,round(innov*100,3)))
+        # [C5 수정] 무제한 메모리 성장 방지 — 초과 시 앞부분 절반 삭제
+        if len(self._log)>self._LOG_MAX:
+            self._log=self._log[self._LOG_MAX//2:]
 
     @property
     def motp_m(self): return self.total_d/self.total_c if self.total_c else 0.0
@@ -702,11 +729,18 @@ def send_mavlink(angle_x, angle_y, distance):
             size_x=0.0, size_y=0.0,
             type=2, position_valid=0)
     except TypeError:
-        # MAVLink 1 (구형 pymavlink 8인자)
-        master.mav.landing_target_send(
-            int(now*1e6),0,frame,angle_x,angle_y,distance,0.0,0.0)
-    print(f"📡 [MAVLink] angle_x:{math.degrees(angle_x):.2f}° "
-          f"angle_y:{math.degrees(angle_y):.2f}° dist:{distance:.2f}m")
+        try:
+            # MAVLink 1 (구형 pymavlink 8인자)
+            master.mav.landing_target_send(
+                int(now*1e6),0,frame,angle_x,angle_y,distance,0.0,0.0)
+        except Exception as mav_err:
+            # [C2 수정] 네트워크 오류(OSError, 소켓 끊김 등) 메인루프 크래시 방지
+            print(f"⚠️ MAVLink 송신 실패 (MAVLink1): {mav_err}")
+            return
+    except Exception as mav_err:
+        # [C2 수정] MAVLink2 전송 중 네트워크/소켓 예외 처리
+        print(f"⚠️ MAVLink 송신 실패 (MAVLink2): {mav_err}")
+        return
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -722,9 +756,11 @@ try:
             continue
 
         # 깊이 후처리 필터 체인
+        # [C1 수정] 필터 후 rs.frame → rs.depth_frame으로 명시 변환
+        # (as_depth_frame() 없이 get_distance() 호출 시 AttributeError 발생)
         depth_frame=spatial_filter.process(depth_frame)
         depth_frame=temporal_filter.process(depth_frame)
-        depth_frame=hole_fill.process(depth_frame)
+        depth_frame=hole_fill.process(depth_frame).as_depth_frame()
 
         color_image=np.asanyarray(color_frame.get_data())
 
@@ -749,60 +785,59 @@ try:
                 x1,y1,x2,y2,score=best
                 cx,cy=(x1+x2)//2,(y1+y2)//2
 
-                # FOV 기반 각도 항상 계산 (깊이 없어도 MAVLink 송신 가능)
-                angle_x,angle_y=fov_angles(cx,cy)
+                # [C7 수정] cx,cy 클램프 → 경계 밖 검출도 FOV 각도 계산 및 MAVLink 송신
+                cx_c=max(0,min(639,cx)); cy_c=max(0,min(479,cy))
+                angle_x,angle_y=fov_angles(cx_c,cy_c)
+                dv=get_median_depth(depth_frame,cx_c,cy_c)
 
                 cv2.rectangle(color_image,(x1,y1),(x2,y2),(0,255,0),2)
-                cv2.circle(color_image,(cx,cy),5,(0,0,255),-1)
+                cv2.circle(color_image,(cx_c,cy_c),5,(0,0,255),-1)
 
-                if 0<=cx<640 and 0<=cy<480:
-                    dv=get_median_depth(depth_frame,cx,cy)
+                if DEPTH_MIN_M<dv<DEPTH_MAX_M:
+                    # 3D 역투영 + 칼만 필터
+                    rx,ry,rz=rs.rs2_deproject_pixel_to_point(intrinsics,[cx_c,cy_c],dv)
+                    fx,fy,fz,vx,vy,vz,innov=single_kf.update(rx,ry,rz)
+                    speed=math.sqrt(vx**2+vy**2+vz**2)
 
-                    if DEPTH_MIN_M<dv<DEPTH_MAX_M:
-                        # 3D 역투영 + 칼만 필터
-                        rx,ry,rz=rs.rs2_deproject_pixel_to_point(intrinsics,[cx,cy],dv)
-                        fx,fy,fz,vx,vy,vz,innov=single_kf.update(rx,ry,rz)
-                        speed=math.sqrt(vx**2+vy**2+vz**2)
+                    # 3D 기반 각도로 덮어쓰기 (더 정확)
+                    angle_x=math.atan2(fx,fz); angle_y=math.atan2(fy,fz)
 
-                        # 3D 기반 각도로 덮어쓰기 (더 정확)
-                        angle_x=math.atan2(fx,fz); angle_y=math.atan2(fy,fz)
+                    if motp_eval: motp_eval.update(innov)
 
-                        if motp_eval: motp_eval.update(innov)
+                    # LSTM
+                    futures=None
+                    if lstm_pred:
+                        lstm_pred.add(fx,fy,fz)
+                        futures=lstm_pred.predict()
 
-                        # LSTM
-                        futures=None
-                        if lstm_pred:
-                            lstm_pred.add(fx,fy,fz)
-                            futures=lstm_pred.predict()
+                    draw_info(color_image,x1,y1,fx,fy,fz,vx,vy,vz,speed)
+                    cv2.putText(color_image,f"Model:{single_kf.model_info}",
+                                (5,20),cv2.FONT_HERSHEY_SIMPLEX,0.45,(200,200,200),1)
 
-                        draw_info(color_image,x1,y1,fx,fy,fz,vx,vy,vz,speed)
-                        cv2.putText(color_image,f"Model:{single_kf.model_info}",
-                                    (5,20),cv2.FONT_HERSHEY_SIMPLEX,0.45,(200,200,200),1)
+                    if futures:
+                        for k,(px_f,py_f,pz_f) in enumerate(futures):
+                            pix=project_to_pixel(px_f,py_f,pz_f)
+                            if pix:
+                                a=1.0-k/len(futures)
+                                cv2.circle(color_image,pix,max(2,int(5*a)),
+                                           (int(255*a),int(100*a),255),-1)
 
-                        if futures:
-                            for k,(px_f,py_f,pz_f) in enumerate(futures):
-                                pix=project_to_pixel(px_f,py_f,pz_f)
-                                if pix:
-                                    a=1.0-k/len(futures)
-                                    cv2.circle(color_image,pix,max(2,int(5*a)),
-                                               (int(255*a),int(100*a),255),-1)
+                    print(f"🎯 [{single_kf.model_info}] "
+                          f"X:{fx*100:.1f} Y:{fy*100:.1f} Z:{fz*100:.1f}cm | "
+                          f"V:{speed*100:.1f}cm/s | innov:{innov*100:.2f}cm"
+                          +(f" | {motp_eval.text()}" if motp_eval else ""))
+                else:
+                    # 깊이 미확정 → FOV 각도만 표시 (원본 동작 보존)
+                    cv2.putText(color_image,"Depth: N/A (Too Close/Far)",
+                                (x1,y1-10),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,255),2)
+                    print(f"🎯 패드 포착(깊이 미확정) -> "
+                          f"angle_x:{math.degrees(angle_x):.1f}° "
+                          f"angle_y:{math.degrees(angle_y):.1f}°")
+                    single_kf.reset()
+                    if lstm_pred: lstm_pred.reset()
 
-                        print(f"🎯 [{single_kf.model_info}] "
-                              f"X:{fx*100:.1f} Y:{fy*100:.1f} Z:{fz*100:.1f}cm | "
-                              f"V:{speed*100:.1f}cm/s | innov:{innov*100:.2f}cm"
-                              +(f" | {motp_eval.text()}" if motp_eval else ""))
-                    else:
-                        # 깊이 미확정 → FOV 각도만 표시 (원본 동작 보존)
-                        cv2.putText(color_image,"Depth: N/A (Too Close/Far)",
-                                    (x1,y1-10),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,255),2)
-                        print(f"🎯 패드 포착(깊이 미확정) -> "
-                              f"angle_x:{math.degrees(angle_x):.1f}° "
-                              f"angle_y:{math.degrees(angle_y):.1f}°")
-                        single_kf.reset()
-                        if lstm_pred: lstm_pred.reset()
-
-                    # MAVLink: 깊이 있으면 3D 각도, 없으면 FOV 각도로 항상 송신
-                    send_mavlink(angle_x,angle_y,dv)
+                # MAVLink: 깊이 있으면 3D 각도, 없으면 FOV 각도로 항상 송신
+                send_mavlink(angle_x,angle_y,dv)
 
                 if motp_eval:
                     cv2.putText(color_image,motp_eval.text(),
