@@ -680,8 +680,10 @@ motp_eval = MOTPEvaluator()             if args.motp       else None
 # ─────────────────────────────────────────────────────────────────────
 def get_median_depth(depth_frame, cx, cy, half=2):
     """5×5 영역 유효 깊이 중앙값 (홀 픽셀 제외)"""
-    vals=[depth_frame.get_distance(cx+dx,cy+dy)
-          for dy in range(-half,half+1) for dx in range(-half,half+1)
+    # get_distance()는 int 인수만 허용 — float 전달 시 TypeError 방지
+    cx, cy = int(cx), int(cy)
+    vals=[depth_frame.get_distance(cx+dx, cy+dy)
+          for dy in range(-half, half+1) for dx in range(-half, half+1)
           if 0<=cx+dx<640 and 0<=cy+dy<480]
     vals=[v for v in vals if v>0]
     return float(np.median(vals)) if vals else 0.0
@@ -767,10 +769,10 @@ try:
             continue
 
         # 깊이 후처리 필터 체인
-        # [C1 수정] 필터 후 rs.frame → rs.depth_frame으로 명시 변환
-        # (as_depth_frame() 없이 get_distance() 호출 시 AttributeError 발생)
-        depth_frame=spatial_filter.process(depth_frame)
-        depth_frame=temporal_filter.process(depth_frame)
+        # 각 필터 출력은 rs.frame 타입 → 매 단계 as_depth_frame() 명시 변환
+        # (마지막 단계에만 적용하면 intermediate frame이 depth_frame 타입을 잃음)
+        depth_frame=spatial_filter.process(depth_frame).as_depth_frame()
+        depth_frame=temporal_filter.process(depth_frame).as_depth_frame()
         depth_frame=hole_fill.process(depth_frame).as_depth_frame()
 
         color_image=np.asanyarray(color_frame.get_data())
@@ -791,7 +793,12 @@ try:
             y1s = ((yc - bh / 2) * (480 / 640)).astype(int)
             x2s = (xc + bw / 2).astype(int)
             y2s = ((yc + bh / 2) * (480 / 640)).astype(int)
-            all_dets = np.column_stack([x1s, y1s, x2s, y2s, sc]).tolist()
+            # column_stack 시 sc(float)로 좌표가 float 업캐스팅되는 문제 방지
+            # → 좌표는 int, score는 float로 명시 분리
+            all_dets = [
+                [int(x1s[i]), int(y1s[i]), int(x2s[i]), int(y2s[i]), float(sc[i])]
+                for i in range(len(vpreds))
+            ]
         else:
             all_dets = []
 
