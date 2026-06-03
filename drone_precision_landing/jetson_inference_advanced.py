@@ -1200,13 +1200,14 @@ try:
                                     (cx_a-50, cy_a-40),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2)
 
-                # [버그2 수정] draw_info: primary 트랙만 1회 호출
-                # y=130 시작: "ByteTrack|..." 텍스트(y=20)와 75px 이상 간격 확보
+                # draw_info: primary 트랙만 1회, 헤더(y=20) 바로 아래 배치
+                # y_top=93 → 텍스트 시작 y=38 (ByteTrack 헤더와 18px 간격)
+                # 레이아웃: y=20(헤더) / y=38,53,68,83(위치·속도 4줄)
                 col_p = track_color(ptid)
                 if dv > 0:
                     speed_p = math.sqrt(vx**2+vy**2+vz**2)
                     traj_log.update('ByteTrack', ptid, fx, fy, fz, vx, vy, vz, speed_p)
-                    draw_info(color_image, 5, 130, fx, fy, fz, vx, vy, vz, speed_p, col_p)
+                    draw_info(color_image, 5, 93, fx, fy, fz, vx, vy, vz, speed_p, col_p)
 
                 # LSTM — 주 트랙만 적용
                 if lstm_pred and dv>0:
