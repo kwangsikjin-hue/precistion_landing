@@ -2,7 +2,7 @@
 
 **파일:** `drone_precision_landing/jetson_inference_advanced.py`  
 **원본:** `drone_precision_landing/jetson_inference.py`  
-**최종 커밋:** `d630197`  
+**최종 커밋:** `e670f34`  
 **작성일:** 2026-06-03
 
 ---
@@ -13,7 +13,9 @@
 2. [커밋별 상세 수정 내용](#2-커밋별-상세-수정-내용)
 3. [카테고리별 수정 항목 전체 목록](#3-카테고리별-수정-항목-전체-목록)
 4. [원본 대비 주요 기능 추가 목록](#4-원본-대비-주요-기능-추가-목록)
-5. [알려진 이슈 및 제약 사항](#5-알려진-이슈-및-제약-사항)
+5. [전체 CLI 인수 목록](#5-전체-cli-인수-목록)
+6. [환경별 실행 예시](#6-환경별-실행-예시)
+7. [알려진 이슈 및 제약 사항](#7-알려진-이슈-및-제약-사항)
 
 ---
 
@@ -27,8 +29,10 @@
 | `edfba97` | fix | 1건 | MAVLink 송출 print 복원 |
 | `31c6ca5` | fix | 3건 | jetson_inference_modify.py 동일 결함 적용 |
 | `d630197` | fix | 2건 | `--stream on` 실행 시 get_distance() 타입 오류 수정 |
+| `b0a37ba` | perf | 5건 | 시작 지연 원인 개선 (진행 메시지·GPU 워밍업·타임아웃 단축) |
+| `e670f34` | feat | 2건 | `--mav`, `--mav-timeout` CLI 인수 추가 |
 
-**총 수정: 19건**
+**총 수정·개선: 26건**
 
 ---
 
@@ -403,6 +407,137 @@ def get_median_depth(depth_frame, cx, cy, half=2):
 
 ---
 
+### 커밋 `b0a37ba` — 시작 지연 원인 개선 (perf)
+
+#### 원인별 시작 소요 시간 분석
+
+```
+[GStreamer --stream on]  x264enc 초기화          ── 2~5초
+[MAVLink]               Heartbeat 대기 (3초)     ── 1~3초  ← 5→3초 단축
+[TensorRT ★가장 느림]   best.engine GPU 로드     ── 5~20초
+[RealSense]             USB 장치+센서 워밍업      ── 1~3초
+[GPU JIT]               첫 추론 커널 컴파일       ── 1~2초  ← 워밍업으로 제거
+```
+
+#### P1 — TensorRT 로딩 진행 메시지 + 소요시간 출력
+
+```python
+# 수정 전: 로딩 중 아무 출력 없음 → 프리즈처럼 보임
+self.engine = runtime.deserialize_cuda_engine(f.read())
+
+# 수정 후: 시작·완료·소요시간 출력
+print(f"⏳ TensorRT 엔진 로딩 중: {engine_path} (5~20초 소요, 잠시 대기)")
+t0 = time.time()
+self.engine = runtime.deserialize_cuda_engine(f.read())
+print(f"✅ TensorRT 엔진 로드 완료 ({time.time()-t0:.1f}초)")
+```
+
+---
+
+#### P2 — GPU 워밍업 더미 추론 추가
+
+**문제:** TensorRT 로드 후 **첫 번째 `execute_v2()`** 호출 시 GPU 커널 JIT 컴파일로 1~2초 지연
+
+```python
+# 수정 후: 빈 더미 이미지로 1회 추론 → 첫 실제 프레임 JIT 제거
+print("⏳ GPU 워밍업 중 (첫 프레임 지연 제거)...")
+_dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+trt_brain.infer(_dummy)
+print("✅ GPU 워밍업 완료")
+```
+
+---
+
+#### P3 — RealSense / GStreamer 초기화 진행 메시지
+
+```python
+# RealSense
+print("⏳ RealSense D435i 초기화 중...")
+profile = pipeline.start(config)
+print("✅ RealSense 초기화 완료")
+
+# GStreamer
+print("📡 [알림] GStreamer UDP 스트리밍 초기화 중... (x264enc 로딩, 2~5초 소요)")
+out = cv2.VideoWriter(...)
+if out.isOpened():
+    print("✅ GStreamer 스트리밍 초기화 완료")
+```
+
+---
+
+#### P4 — MAVLink Heartbeat 타임아웃 5초 → 3초 단축
+
+```python
+# 수정 전
+msg = master.recv_match(type='HEARTBEAT', blocking=True, timeout=5)
+
+# 수정 후 (--mav-timeout 인수로 조절 가능, 기본 3초)
+msg = master.recv_match(type='HEARTBEAT', blocking=True, timeout=args.mav_timeout)
+```
+
+---
+
+#### P5 — 전체 초기화 총 소요시간 표시
+
+```python
+_startup_begin = time.time()
+# ... 모든 초기화 ...
+_startup_sec = time.time() - _startup_begin
+print(f"🚀 [성공] 전체 초기화 완료 — 총 소요시간: {_startup_sec:.1f}초")
+```
+
+---
+
+### 커밋 `e670f34` — `--mav`, `--mav-timeout` CLI 인수 추가 (feat)
+
+#### 배경 — `udpin:0.0.0.0` 사용 시 문제점
+
+```
+기존: udpin:0.0.0.0:14551 → 모든 인터페이스 수신 대기
+      FC가 먼저 Heartbeat 보내야 연결 시작 (최대 5초 대기)
+
+개선: 특정 IP 또는 udpout 지정으로 연결 방식 선택 가능
+      udpout = Jetson이 FC에 먼저 연결 요청 → Heartbeat 즉시 수신
+```
+
+#### E1 — `--mav` 인수: MAVLink 연결 주소 설정
+
+```python
+# 추가된 인수
+parser.add_argument('--mav', type=str, default='udpin:0.0.0.0:14551',
+                    help='MAVLink 연결 주소\n'
+                         '  udpout:192.168.0.10:14550  (SITL PC, 빠름)\n'
+                         '  udpin:192.168.0.5:14551    (특정 인터페이스)\n'
+                         '  /dev/ttyUSB0               (USB-UART 직렬)')
+```
+
+연결 방식별 특성:
+
+| 방식 | 예시 | 속도 | 비고 |
+|------|------|------|------|
+| `udpin:0.0.0.0` | 기존 기본값 | 느림 | 모든 인터페이스, FC 먼저 Heartbeat |
+| `udpin:특정IP` | `udpin:192.168.0.5:14551` | 보통 | 단일 인터페이스, 노이즈 감소 |
+| `udpout:FC_IP` | `udpout:192.168.0.10:14550` | 빠름 | Jetson이 먼저 연결, 즉시 Heartbeat |
+| `/dev/ttyUSBx` | `/dev/ttyUSB0` | 가장 빠름 | USB-UART 직렬, 지연 최소 |
+
+---
+
+#### E2 — `--mav-timeout` 인수: Heartbeat 대기 시간 설정
+
+```python
+parser.add_argument('--mav-timeout', type=int, default=3, metavar='SEC',
+                    help='MAVLink Heartbeat 대기 타임아웃 초 (기본: 3)')
+```
+
+| 상황 | 권장값 |
+|------|--------|
+| FC 연결 확실 (실기체) | `1` |
+| SITL 동시 시작 | `3` (기본) |
+| FC 불확실 | `5` |
+| FC 없이 영상만 | `0` |
+
+---
+
 ## 3. 카테고리별 수정 항목 전체 목록
 
 ### 🔴 런타임 크래시 방지 (7건)
@@ -444,6 +579,18 @@ def get_median_depth(depth_frame, cx, cy, half=2):
 | `C8` | `if True:` 제거 후 블록 들여쓰기 재정렬 |
 | `get_median_depth` | `int()` 캐스팅 안전망 추가 |
 
+### 🔵 성능·UX 개선 (7건)
+
+| 항목 | 커밋 | 내용 |
+|------|------|------|
+| `P1` | `b0a37ba` | TensorRT 로딩 진행 메시지 + 소요시간 출력 |
+| `P2` | `b0a37ba` | GPU 워밍업 더미 추론 (첫 프레임 JIT 지연 제거) |
+| `P3` | `b0a37ba` | RealSense / GStreamer 초기화 진행 메시지 |
+| `P4` | `b0a37ba` | MAVLink Heartbeat 타임아웃 5초 → 3초 단축 |
+| `P5` | `b0a37ba` | 전체 초기화 총 소요시간 측정·출력 |
+| `E1` | `e670f34` | `--mav` 인수 추가 (연결 주소 자유 설정) |
+| `E2` | `e670f34` | `--mav-timeout` 인수 추가 (타임아웃 조절) |
+
 ---
 
 ## 4. 원본 대비 주요 기능 추가 목록
@@ -480,14 +627,66 @@ def get_median_depth(depth_frame, cx, cy, half=2):
 
 ---
 
-## 5. 알려진 이슈 및 제약 사항
+## 5. 전체 CLI 인수 목록
+
+| 인수 | 기본값 | 설명 |
+|------|--------|------|
+| `--stream` | `off` | GStreamer UDP 스트리밍 (`on` / `off`) |
+| `--model` | `cv` | 칼만 필터 모델 (`cv` / `ca` / `ctrv` / `imm`) |
+| `--tracker` | `single` | 추적 방식 (`single` / `bytetrack`) |
+| `--predict` | `0` | LSTM 미래 예측 스텝 수 (0=비활성) |
+| `--motp` | 비활성 | MOTP 추적 정밀도 평가 플래그 |
+| `--mav` | `udpin:0.0.0.0:14551` | MAVLink 연결 주소 |
+| `--mav-timeout` | `3` | Heartbeat 대기 타임아웃 (초) |
+
+---
+
+## 6. 환경별 실행 예시
+
+```bash
+# SITL 시뮬레이터 (PC에서 ArduPilot SITL 실행 중)
+# → udpout으로 Jetson이 먼저 연결, Heartbeat 즉시 수신
+python3 jetson_inference_advanced.py \
+    --mav udpout:192.168.0.10:14550 \
+    --mav-timeout 1 \
+    --stream on --model ctrv
+
+# 실기체 Pixhawk (USB-UART 직렬 연결) ← 가장 빠른 방식
+python3 jetson_inference_advanced.py \
+    --mav /dev/ttyUSB0 \
+    --stream on --model ctrv
+
+# 실기체 (특정 네트워크 인터페이스 고정)
+python3 jetson_inference_advanced.py \
+    --mav udpin:192.168.0.5:14551 \
+    --mav-timeout 2 \
+    --stream on
+
+# 개발·테스트 (FC 없이 영상 처리만)
+python3 jetson_inference_advanced.py \
+    --mav udpin:0.0.0.0:14551 \
+    --mav-timeout 0 \
+    --stream off --model imm --tracker bytetrack
+
+# 연구용 풀 옵션
+python3 jetson_inference_advanced.py \
+    --stream on --model ctrv --tracker bytetrack \
+    --predict 15 --motp \
+    --mav udpout:192.168.0.10:14550 --mav-timeout 1
+```
+
+---
+
+## 7. 알려진 이슈 및 제약 사항
 
 | 항목 | 내용 | 권장 조치 |
 |------|------|-----------|
+| 시작 시간 | TensorRT 로딩 5~20초 불가피 | 진행 메시지로 상태 확인 가능 |
 | LSTM 학습 블로킹 | 50ms 이상 시 경고 출력 | `EPOCHS=3` 또는 `TRAIN_EVERY=30` 으로 줄이기 |
 | ByteTrack `max_lost=30` | 소실 1초(30fps) 후 트랙 삭제 | 필요 시 `max_lost=60` 으로 늘리기 |
 | MAVLink 재연결 없음 | 비행 중 연결 끊기면 복구 불가 | 추후 주기적 heartbeat 확인 로직 추가 필요 |
 | CTRV Joseph P 업데이트 | 수치 정밀도 향상되나 연산량 증가 | 고부하 시 `--model cv` 사용 권장 |
+| `--mav-timeout 0` | Heartbeat 없이 즉시 진행 | FC 없이 영상만 처리할 때만 사용 |
 | Windows IDE 모듈 오류 | cv2, pyrealsense2 등 Not Found 표시 | Jetson Nano 환경에서만 정상 실행됨 — Windows Python 환경 오탐 |
 
 ---
@@ -497,6 +696,9 @@ def get_median_depth(depth_frame, cx, cy, half=2):
 ```
 git log --oneline drone_precision_landing/jetson_inference_advanced.py
 
+e670f34 feat: MAVLink 연결 주소·타임아웃을 CLI 인수로 분리 (--mav, --mav-timeout)
+b0a37ba perf: 시작 지연 원인 개선 — 진행 메시지·워밍업·타임아웃 단축
+a810992 docs: jetson_inference_advanced.py 전체 수정 이력 매뉴얼 추가
 d630197 fix: --stream on 실행 시 get_distance() 타입 오류 2건 수정
 31c6ca5 fix: jetson_inference_modify.py 동일 결함 3건 advanced 버전에도 적용
 edfba97 fix: C2 예외처리 추가 시 실수로 삭제된 MAVLink 송출 print 복원
@@ -509,4 +711,4 @@ a7e80b1 fix: ByteTrack 논리 버그 4건 및 안전성 개선 5건 수정
 
 ---
 
-*본 매뉴얼은 `jetson_inference_advanced.py` 커밋 `d630197` 기준으로 작성되었습니다.*
+*본 매뉴얼은 `jetson_inference_advanced.py` 커밋 `e670f34` 기준으로 작성되었습니다.*
