@@ -105,7 +105,9 @@ try:
     if msg:
         print("🛸 [성공] ArduPilot FC MAVLink 연결 완료!")
     else:
-        print("⚠️ [경고] 5초간 Heartbeat 없음 — 영상 처리만 강행합니다.")
+        # [M4] 타임아웃 시 master=None — 원본은 master 객체가 남아 의미없는 패킷을 계속 송신
+        print("⚠️ [경고] 5초간 Heartbeat 없음 — master=None 처리 후 영상 처리만 진행합니다.")
+        master = None
 except Exception as e:
     print(f"⚠️ FC 연결 실패: {e}")
     master = None
@@ -134,7 +136,11 @@ class JetsonTRTEngine:
             dtype    = trt.nptype(self.engine.get_binding_dtype(binding))
             host_mem = np.empty(shape, dtype=dtype)
             cuda_ptr = ctypes.c_void_p()
-            self.cuda_lib.cudaMalloc(ctypes.byref(cuda_ptr), host_mem.nbytes)
+            # [C2] cudaMalloc 반환 코드 확인 — 0이 아니면 GPU 메모리 부족
+            ret = self.cuda_lib.cudaMalloc(ctypes.byref(cuda_ptr), host_mem.nbytes)
+            if ret != 0:
+                raise RuntimeError(
+                    f"cudaMalloc 실패 (에러코드: {ret}) — GPU 메모리 부족 가능성")
             self._ptrs.append(cuda_ptr)
             self.bindings.append(int(cuda_ptr.value))
             buf = {'host': host_mem, 'device': cuda_ptr.value, 'bytes': host_mem.nbytes}
@@ -769,16 +775,25 @@ try:
 
         color_image=np.asanyarray(color_frame.get_data())
 
-        # TensorRT 추론 → score 0.3 이상 박스 수집
-        raw_out=trt_brain.infer(color_image).reshape(5,8400).T
-        all_dets=[]
-        for pred in raw_out:
-            score=float(pred[4])
-            if score<0.3: continue
-            xc,yc,w,h=pred[:4]
-            x1=int(xc-w/2); y1=int((yc-h/2)*(480/640))
-            x2=int(xc+w/2); y2=int((yc+h/2)*(480/640))
-            all_dets.append([x1,y1,x2,y2,score])
+        # [M1] TensorRT 추론 → numpy 벡터화로 8400개 필터링
+        # 원본: Python for 루프 8400회 → ~5~15ms 지연
+        # 수정: numpy 마스킹+슬라이싱 → ~0.1ms
+        raw_out = trt_brain.infer(color_image).reshape(5, 8400).T  # (8400, 5)
+        scores  = raw_out[:, 4]
+        vmask   = scores >= 0.3          # ByteTrack 저신뢰도 포함 최소 임계값
+        vpreds  = raw_out[vmask]         # (N, 5) — score 0.3 이상 박스만
+
+        if len(vpreds):
+            xc  = vpreds[:, 0];  yc = vpreds[:, 1]
+            bw  = vpreds[:, 2];  bh = vpreds[:, 3]
+            sc  = vpreds[:, 4]
+            x1s = (xc - bw / 2).astype(int)
+            y1s = ((yc - bh / 2) * (480 / 640)).astype(int)
+            x2s = (xc + bw / 2).astype(int)
+            y2s = ((yc + bh / 2) * (480 / 640)).astype(int)
+            all_dets = np.column_stack([x1s, y1s, x2s, y2s, sc]).tolist()
+        else:
+            all_dets = []
 
         # ══════════════════════════════════════════════════════════════
         # 모드 A: single — 최고 신뢰도 단일 객체
