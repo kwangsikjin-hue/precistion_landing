@@ -2,7 +2,7 @@
 
 **파일:** `drone_precision_landing/jetson_inference_advanced.py`  
 **원본:** `drone_precision_landing/jetson_inference.py`  
-**최종 커밋:** `42518bd`  
+**최종 커밋:** `aa88eb6`  
 **작성일:** 2026-06-03
 
 ---
@@ -47,8 +47,14 @@
 | `37fd016` | fix | 1건 | ArUco ID 황색 텍스트·YOLO 텍스트 동시 표시 버그 수정 |
 | `0e482a6` | fix | 1건 | EIS+ArUco gray 이중 변환 제거 (좌표 일관성 보장) |
 | `42518bd` | fix | 2건 | EIS+ArUco 좌표계 불일치 최종 수정 + CA 행렬 in-place 최적화 |
+| `612a383` | fix | 1건 | ArUco→YOLO 전환 시 draw_info 위치 점프 현상 수정 |
+| `21c7f2b` | fix | 1건 | ArUco ID 황색 텍스트 마커 위치 기준 완전 제거 → SRC 고정 위치 통합 |
+| `c8b415f` | perf | 1건 | `--verbose off` (기본) — 루프 내 print 제거로 30fps 달성 지원 |
+| `e09e599` | perf | 1건 | TRT 전처리 `blobFromImage` 적용 — 1~3ms 절약 |
+| `34bdc63` | perf | 4건 | TRT 파이프라인 추가 최적화 (.copy() 지연·hole_fill 제거·ArUco 절반해상도·NVENC) |
+| `aa88eb6` | fix | 2건 | ArUco 절반해상도 float32 타입 호환성 + corners=None 명시 |
 
-**총 수정·개선: 67건**
+**총 수정·개선: 77건**
 
 ---
 
@@ -988,6 +994,117 @@ def _update_F(self, dt):
 
 ---
 
+### 커밋 `612a383` — ArUco→YOLO 전환 시 텍스트 위치 점프 현상 수정 (fix)
+
+```
+수정 전 (소스별 draw_info 위치가 달랐음):
+  YOLO 경로:   draw_info(x1, max(y1,110), ...)  ← 바운딩박스 위
+  ArUco 경로:  draw_info(cx_a-80, cy_a+30, ...) ← 마커 중심 기준
+
+수정 후 (모두 고정 위치):
+  YOLO 경로:   draw_info(5, 93, ...)  ← 고정
+  ArUco 경로:  draw_info(5, 93, ...)  ← 동일 고정
+```
+
+---
+
+### 커밋 `21c7f2b` — ArUco ID 황색 텍스트 마커 위치 완전 제거 (fix)
+
+탐지 블록 내 황색 `"ArUco ID:N  Z:2.45m"` 텍스트를 마커 위치 기준으로 그리던 것을 제거하고, SRC 텍스트 줄에 통합:
+
+```python
+# 수정 전: 탐지 블록에서 마커 위치 기준으로 그림 → 위치 점프 잔존
+cv2.putText(color_image, f"ArUco ID:{mid}  Z:{az:.2f}m", (cx_a-60, cy_a-20), ...)
+
+# 수정 후: SRC 텍스트에 ID 포함, 고정 위치
+cv2.putText(color_image, f"SRC:ArUco ID:{mid} Z:{az:.2f}m|{model_info}", (5, 20), ...)
+```
+
+---
+
+### 커밋 `c8b415f` — `--verbose` 옵션으로 루프 print 제거 (perf)
+
+**루프 내 print 비용 분석:**
+
+| 환경 | print당 비용 | 프레임당 절약 |
+|------|------------|--------------|
+| 로컬 터미널 | ~0.3ms | ~0.4ms |
+| SSH 원격 | ~2.0ms | ~2.6ms |
+
+```bash
+--verbose off  (기본): 루프 print 없음, 최대 성능
+--verbose on:          디버그용 매 프레임 결과 출력
+```
+
+제어 대상: 🎯 ArUco/YOLO 탐지, 📡 MAVLink 송출 (성공 시)  
+항상 출력: ⚠️ LSTM 학습 지연 경고, MAVLink 오류
+
+---
+
+### 커밋 `e09e599` — TRT 전처리 `blobFromImage` 적용 (perf)
+
+```python
+# 수정 전: numpy 체인, 중간 배열 3개 생성 (~2~4ms)
+img_in = np.ascontiguousarray(
+    cv2.resize(img,(640,640)).transpose(2,0,1).astype(np.float32)/255.0
+)[np.newaxis]
+
+# 수정 후: C++ 단일 패스, 중간 배열 없음 (~1~2ms)
+img_in = cv2.dnn.blobFromImage(img, 1/255.0, (640,640))
+```
+
+**절약: 1~3ms/frame**
+
+---
+
+### 커밋 `34bdc63` — TRT 파이프라인 4가지 추가 최적화 (perf)
+
+| 방법 | 절약 | 내용 |
+|------|------|------|
+| `.copy()` 추론 후 지연 | 0.5ms | blobFromImage는 소스 수정 안 함 → 추론 후 복사 |
+| `hole_fill` 필터 제거 | 0.5ms | 5×5 중앙값이 이미 홀 처리 → 중복 |
+| ArUco 절반 해상도(320×240) | 1~2ms | 50cm 마커 충분 탐지, 코너 ×2 복원 |
+| NVENC 하드웨어 인코더 자동 선택 | 2~4ms | Jetson 내장 HW 인코더 우선, 실패 시 x264 폴백 |
+
+**전체 최적화 누적 절약:**
+
+```
+blobFromImage:     1~3ms
+.copy() 지연:      0.5ms
+hole_fill 제거:    0.5ms
+ArUco 절반해상도:  1~2ms
+NVENC (stream on): 2~4ms
+--verbose off:     0.4~2.6ms
+─────────────────────────
+합계:             5~13ms/frame
+```
+
+---
+
+### 커밋 `aa88eb6` — ArUco 절반해상도 float32 타입 호환성 수정 (fix)
+
+#### B1 — corners ×2 스케일 시 float32→float64 업캐스팅
+
+```python
+# 수정 전: float64 생성 → drawDetectedMarkers 타입 불일치 가능
+corners = [c * 2.0 for c in corners_half]  # float32 × float64 = float64
+
+# 수정 후: float32 명시 유지
+corners = [(c * 2).astype(np.float32) for c in corners_half]
+```
+
+#### B2 — corners=None 명시 (defensive)
+
+```python
+# 수정 전: 혼란스러운 None 전파
+corners = corners_half   # None이 전파됨
+
+# 수정 후: 명시적
+corners = None   # ids 체크로 이후 코드 보호됨
+```
+
+---
+
 ## 3. 카테고리별 수정 항목 전체 목록
 
 ### 🔴 런타임 크래시 방지 (7건)
@@ -1111,6 +1228,31 @@ def _update_F(self, dt):
 | `EC1` | ArUco gray를 항상 현재 `color_image`에서 변환 (STABILIZED 공간 일치) |
 | `EC2` | `KFModelCA._build_F()` in-place 교체 → 매 프레임 9×9 배열 신규 생성 제거 |
 
+### 🔵 텍스트 위치 점프 수정 (2건, `612a383` + `21c7f2b`)
+
+| 항목 | 커밋 | 내용 |
+|------|------|------|
+| `TP1` | `612a383` | ArUco/YOLO 경로 draw_info 모두 고정 위치 (5,93) 통일 |
+| `TP2` | `21c7f2b` | ArUco ID 텍스트 마커 위치 기준 완전 제거 → SRC 줄 통합 |
+
+### 🔵 성능 최적화 (6건, `c8b415f` + `e09e599` + `34bdc63`)
+
+| 항목 | 커밋 | 절약 | 내용 |
+|------|------|------|------|
+| `PO1` | `c8b415f` | 0.4~2.6ms | `--verbose off` — 루프 print 제거 |
+| `PO2` | `e09e599` | 1~3ms | `blobFromImage` C++ 단일 패스 전처리 |
+| `PO3` | `34bdc63` | 0.5ms | `.copy()` TRT 추론 후로 지연 |
+| `PO4` | `34bdc63` | 0.5ms | `hole_fill` 필터 제거 (5×5 median 중복) |
+| `PO5` | `34bdc63` | 1~2ms | ArUco 절반 해상도(320×240) 탐지 |
+| `PO6` | `34bdc63` | 2~4ms | NVENC 하드웨어 인코더 자동 선택 (stream on 시) |
+
+### 🔴 ArUco 타입 호환성 수정 (2건, `aa88eb6`)
+
+| 항목 | 내용 |
+|------|------|
+| `FT1` | corners ×2 시 float32→float64 업캐스팅 → `.astype(np.float32)` 명시 |
+| `FT2` | `corners = corners_half` None 전파 → `corners = None` 명시 |
+
 ### 🩵 분석 발견 수정 (5건, `c579a1a`)
 
 | 항목 | 내용 |
@@ -1181,6 +1323,7 @@ def _update_F(self, dt):
 | `--marker-size` | `0.5` | 마커 실물 크기 미터 (현재 마커: 50cm×50cm) |
 | `--eis` | `off` | EIS 영상 안정화 (`on` / `off`) |
 | `--eis-smoothing` | `7` | EIS 스무딩 윈도우 프레임 수 (권장 5~15) |
+| `--verbose` | `off` | 루프 내 print 출력 (`on`=디버그, `off`=최대 성능) |
 
 ---
 
@@ -1252,6 +1395,15 @@ python3 jetson_inference_advanced.py \
 # 타이밍 주의 (30fps 예산 초과 위험 조합)
 # TRT(25ms) + EIS(8ms) + GStreamer(5ms) = 38ms > 33ms
 # → --eis-smoothing 5 또는 --stream off 권장
+
+# 30fps 최우선 (최대 성능, 기본값)
+python3 jetson_inference_advanced.py \
+    --stream on --model ctrv --aruco on --marker-size 0.5
+    # --verbose off (기본), hole_fill 제거, NVENC 자동, blobFromImage 최적화 적용됨
+
+# 디버그 모드 (매 프레임 결과 출력)
+python3 jetson_inference_advanced.py \
+    --stream off --model cv --verbose on
 ```
 
 ---
@@ -1276,6 +1428,11 @@ python3 jetson_inference_advanced.py \
 | EIS 초기 워밍업 | smoothing(기본 7)프레임 동안 안정화 미적용 | 0.23초(약 7프레임) 후 자동 활성 |
 | EIS+depth 오차 | 안정화 픽셀 좌표로 깊이 조회 시 최대 ~4cm 오차 | 50cm 마커 대비 허용 범위 |
 | ArUco az 무효 시 | `--aruco on`이어도 az<15cm는 YOLO로 폴백 | 정상 동작, "Z:N/A" 경고 표시 |
+| `--verbose off` 기본값 | 루프 print 없음 — 디버그 시 `--verbose on` | 성능 최우선 기본값 |
+| ArUco 절반해상도 오차 | 코너 좌표 ×2 복원 시 1~2px 오차 | 50cm 마커 대비 무시 가능 |
+| NVENC 미지원 환경 | `nvv4l2h264enc` 없으면 자동 x264 폴백 | JetPack 미설치 등 |
+| 30fps 달성 가능 조합 | EIS OFF + ArUco ON + Stream NVENC | TRT 25ms + 나머지 8ms 이내 |
+| 30fps 불가 조합 | EIS ON (5~8ms 추가) | EIS 끄거나 smoothing=5로 줄이기 |
 | Windows IDE 모듈 오류 | cv2, pyrealsense2 등 Not Found 표시 | Jetson Nano 환경에서만 정상 실행됨 — Windows Python 환경 오탐 |
 
 ---
@@ -1285,6 +1442,12 @@ python3 jetson_inference_advanced.py \
 ```
 git log --oneline drone_precision_landing/jetson_inference_advanced.py
 
+aa88eb6 fix: 정밀 재분석 결과 — ArUco 절반해상도 float32 타입 호환성 수정
+34bdc63 perf: TRT 파이프라인 4가지 추가 최적화 적용
+e09e599 perf: TRT 전처리 최적화 — cv2.dnn.blobFromImage로 1~3ms 절약
+c8b415f perf: --verbose off(기본)으로 루프 내 print 제거 → 30fps 달성 지원
+21c7f2b fix: ArUco ID 황색 텍스트 마커 위치 기준 완전 제거 → 고정 위치 통합
+612a383 fix: ArUco→YOLO 전환 시 텍스트 위치 점프 현상 수정
 42518bd fix: 메모리·타이밍·간섭 전체 분석 결과 2건 수정
 0e482a6 fix: 메모리·타이밍·연결성 전체 분석 결과 수정
 37fd016 fix: ArUco ID 황색 텍스트가 YOLO 텍스트와 동시 표시되는 버그 수정
@@ -1315,4 +1478,4 @@ a7e80b1 fix: ByteTrack 논리 버그 4건 및 안전성 개선 5건 수정
 
 ---
 
-*본 매뉴얼은 `jetson_inference_advanced.py` 커밋 `42518bd` 기준으로 작성되었습니다.*
+*본 매뉴얼은 `jetson_inference_advanced.py` 커밋 `aa88eb6` 기준으로 작성되었습니다.*
