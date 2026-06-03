@@ -741,6 +741,11 @@ def send_mavlink(angle_x, angle_y, distance):
         # [C2 수정] MAVLink2 전송 중 네트워크/소켓 예외 처리
         print(f"⚠️ MAVLink 송신 실패 (MAVLink2): {mav_err}")
         return
+    # 송신 성공 시 각도/거리 출력
+    print(f"📡 [MAVLink] LANDING_TARGET 송출 -> "
+          f"angle_x:{math.degrees(angle_x):.2f}°, "
+          f"angle_y:{math.degrees(angle_y):.2f}°, "
+          f"Dist:{distance:.2f}m")
 
 
 # ─────────────────────────────────────────────────────────────────────
