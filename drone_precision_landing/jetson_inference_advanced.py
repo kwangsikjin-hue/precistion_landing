@@ -472,8 +472,8 @@ class ByteTracker:
 
     def _associate(self, tracks, dets, iou_thresh):
         if not tracks or not dets:
-            return [],[list(range(len(tracks))),list(range(len(dets)))][0 if not tracks else 1],\
-                   [list(range(len(dets))),list(range(len(tracks)))][0 if not dets else 1]
+            # 어느 쪽이 비어있어도: 매칭=없음, 미매칭트랙=전부, 미매칭검출=전부
+            return [], list(range(len(tracks))), list(range(len(dets)))
         cost=np.array([[1.0-self._iou(t.tlbr,d[:4]) for d in dets] for t in tracks])
         if SCIPY_AVAILABLE:
             ri,ci=linear_sum_assignment(cost)
@@ -504,15 +504,21 @@ class ByteTracker:
 
         rem_high=[high[i] for i in ud1]
         m3,_,ud3=self._associate(self.lost,rem_high,0.5)
-        for ti,di in m3: self.lost[ti].update(rem_high[di],self.frame_id)
+        # 소실 트랙 중 재매칭된 것은 별도 수집 후 state='tracked' 복귀
+        reactivated=[]
+        for ti,di in m3:
+            self.lost[ti].update(rem_high[di],self.frame_id)
+            reactivated.append(self.lost[ti])   # state가 'tracked'로 바뀜
 
         new_tracks=[STrack(rem_high[i],self._next_id+k,self.frame_id) for k,i in enumerate(ud3)]
         self._next_id+=len(new_tracks)
 
+        # self.lost 갱신: 재매칭(state='tracked')된 것은 이미 reactivated로 분리됨
         self.lost=[t for t in self.lost+newly_lost
                    if self.frame_id-t.last_frame<=self.max_lost and t.state=='lost']
+        # self.tracked 갱신: 기존 tracked + 재활성 + 신규
         self.tracked=([t for t in self.tracked if t.state=='tracked']
-                      +[t for t in self.lost if t.state=='tracked']+new_tracks)
+                      +reactivated+new_tracks)
         return [t for t in self.tracked if t.is_confirmed]
 
 
@@ -562,7 +568,7 @@ class LSTMPredictor:
             self.opt.zero_grad(); loss=self.crit(self.net(X),Y); loss.backward(); self.opt.step()
 
     def predict(self):
-        if len(self.buf)<self.SEQ_LEN: return None
+        if len(self.buf)<self.SEQ_LEN or self.ref is None: return None
         if not self.ready or not TORCH_AVAILABLE:
             tail=np.array(list(self.buf)[-5:])
             vel=(tail[-1]-tail[0])/max(len(tail)-1,1)
@@ -663,9 +669,9 @@ def project_to_pixel(fx, fy, fz):
 
 
 def track_color(tid):
-    """트랙 ID → 고유 BGR 색상"""
-    np.random.seed(tid*17%256)
-    return tuple(int(c) for c in np.random.randint(80,255,3))
+    """트랙 ID → 고유 BGR 색상 (독립 RNG로 전역 난수 상태 오염 방지)"""
+    rng=np.random.RandomState(tid*17%256)
+    return tuple(int(c) for c in rng.randint(80,255,3))
 
 
 def draw_info(img, x1, y_top, fx, fy, fz, vx, vy, vz, speed, color=(255,255,0)):
@@ -863,9 +869,10 @@ try:
                                            (int(255*a),int(100*a),255),-1)
 
                 send_mavlink(angle_x,angle_y,dv)
+                pos_str=(f"X:{fx*100:.1f} Y:{fy*100:.1f} Z:{fz*100:.1f}cm"
+                         if dv>0 else "깊이미확정(FOV각도로송신)")
                 print(f"[ByteTrack|{args.model.upper()}] 활성:{len(active)}개 | "
-                      f"주트랙ID:{ptid} score:{sc:.2f} | "
-                      f"X:{fx*100:.1f} Y:{fy*100:.1f} Z:{fz*100:.1f}cm"
+                      f"주트랙ID:{ptid} score:{sc:.2f} | {pos_str}"
                       +(f" | {motp_eval.text()}" if motp_eval else ""))
             else:
                 if lstm_pred: lstm_pred.reset()
