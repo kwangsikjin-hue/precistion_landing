@@ -800,11 +800,12 @@ class FrameStabilizer:
         # ② Lucas-Kanade 광류로 특징점 추적
         curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
             self._prev_gray, gray, prev_pts, None, **self._LK)
-        if curr_pts is None:
+        # curr_pts 또는 status가 None이면 크래시 → 둘 다 체크
+        if curr_pts is None or status is None:
             self._prev_gray = gray
             return frame
 
-        valid    = status.flatten() == 1
+        valid = status.flatten() == 1
         if valid.sum() < 10:
             self._prev_gray = gray
             return frame
@@ -816,7 +817,12 @@ class FrameStabilizer:
         T, inliers = cv2.estimateAffinePartial2D(prev_good, curr_good,
                                                   method=cv2.RANSAC,
                                                   ransacReprojThreshold=3.0)
-        if T is None:
+        # T 또는 inliers가 None이면 추정 실패 → 원본 반환
+        if T is None or inliers is None:
+            self._prev_gray = gray
+            return frame
+        # RANSAC 인라이어 부족 → 변환 신뢰 불가 → 원본 반환
+        if int(inliers.sum()) < 8:
             self._prev_gray = gray
             return frame
 
@@ -824,14 +830,20 @@ class FrameStabilizer:
         dy = float(T[1, 2])
         da = float(math.atan2(T[1, 0], T[0, 0]))
 
-        # ④ 누적 궤적 갱신 + 이동 평균으로 평활 궤적 계산
+        # ④ 누적 궤적 갱신
         self._cum_dx += dx
         self._cum_dy += dy
         self._cum_da += da
         self._traj.append((self._cum_dx, self._cum_dy, self._cum_da))
 
-        # 평활 궤적 (이동 평균)
-        n          = len(self._traj)
+        # 스무딩 윈도우가 채워지기 전: 안정화 불충분 → 원본 반환
+        # (초기 smoothing 프레임은 평균 기준점이 부정확)
+        if len(self._traj) < self.smoothing:
+            self._prev_gray = gray
+            return frame
+
+        # 평활 궤적 (이동 평균, 윈도우 완충 이후)
+        n          = len(self._traj)   # == self.smoothing (deque maxlen 도달)
         smooth_dx  = sum(t[0] for t in self._traj) / n
         smooth_dy  = sum(t[1] for t in self._traj) / n
         smooth_da  = sum(t[2] for t in self._traj) / n
@@ -1084,8 +1096,13 @@ try:
         color_image=np.asanyarray(color_frame.get_data()).copy()
 
         # ── EIS 소프트웨어 영상 안정화 (--eis on 시) ─────────────────────
-        # YOLO·ArUco·시각화 모두 안정화된 프레임 사용 → 인식률 향상
-        # 주의: 깊이 프레임은 별도(원본 좌표계) → 미세 정합 오차 ~2cm 허용
+        # 안정화 범위: YOLO 추론 · ArUco 탐지 · 시각화 전부 적용 → 인식률 향상
+        # 깊이 좌표 불일치:
+        #   안정화 후 픽셀 좌표(cx,cy)로 depth_frame.get_distance() 호출 시
+        #   depth_frame은 원본 좌표계 → 미세 정합 오차 발생
+        #   오차 크기 = shift_px × depth_m × 0.00188rad/px
+        #   예) 10px 이동, 2m 고도 → 약 3.8cm 오차
+        #   50cm 마커 대비 허용 가능 범위 (고도 0.5m 이하 접근 시 1cm 미만)
         if stabilizer is not None:
             color_image = stabilizer.stabilize(color_image)
 
