@@ -265,7 +265,9 @@ class KFModelCA:
         self.kf=cv2.KalmanFilter(9,3)
         H=np.zeros((3,9),dtype=np.float32); H[0,0]=H[1,1]=H[2,2]=1.0
         self.kf.measurementMatrix=H
-        self.kf.transitionMatrix=np.eye(9,dtype=np.float32)
+        # F 행렬 템플릿: 매 프레임 신규 생성 대신 dt 값만 교체
+        self._F_template=np.eye(9,dtype=np.float32)
+        self.kf.transitionMatrix=self._F_template
         q=np.zeros((9,9),dtype=np.float32)
         q[0:3,0:3]=np.eye(3)*1e-3; q[3:6,3:6]=np.eye(3)*1e-1; q[6:9,6:9]=np.eye(3)*1e-1
         self.kf.processNoiseCov=q
@@ -276,11 +278,13 @@ class KFModelCA:
         p=np.eye(9,dtype=np.float32); p[3:6,3:6]*=10.0; p[6:9,6:9]*=100.0
         self.kf.errorCovPost=p
 
-    def _build_F(self, dt):
-        F=np.eye(9,dtype=np.float32)
+    def _update_F(self, dt):
+        """dt 값만 in-place 교체 — 매 프레임 9×9 배열 신규 생성 제거"""
+        F = self._F_template
         for i in range(3):
-            F[i,i+3]=dt; F[i,i+6]=0.5*dt*dt; F[i+3,i+6]=dt
-        return F
+            F[i, i+3] = dt
+            F[i, i+6] = 0.5 * dt * dt
+            F[i+3, i+6] = dt
 
     def _init(self, x, y, z, t):
         self._reset_cov()
@@ -292,7 +296,7 @@ class KFModelCA:
         if not self.initialized:
             self._init(x,y,z,now); return x,y,z,0.,0.,0.,0.
         dt=max(now-self.prev_time,1e-3); self.prev_time=now
-        self.kf.transitionMatrix=self._build_F(dt)
+        self._update_F(dt)   # 템플릿 in-place 갱신 (배열 신규 생성 없음)
         pred=self.kf.predict()
         meas=np.array([[x],[y],[z]],dtype=np.float32)
         innov=float(np.linalg.norm(meas.flatten()-pred[:3].flatten()))
@@ -1116,13 +1120,12 @@ try:
         aruco_pose = None   # (ax, ay, az, rvec, tvec, marker_id, cx_a, cy_a)
 
         if _aruco_detect is not None:
-            # 그레이스케일 재사용 최적화:
-            # stabilize() 반환 후 _prev_gray = 현재 프레임 gray (모든 경로에서 갱신됨)
-            # EIS ON 시 이미 변환된 gray 재사용 → 이중 변환(300KB+1ms) 제거
-            if stabilizer is not None and stabilizer._prev_gray is not None:
-                gray_img = stabilizer._prev_gray   # 현재 프레임 gray 재사용
-            else:
-                gray_img = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+            # 항상 현재 color_image에서 gray 변환 (EIS 안정화 여부 무관)
+            # 이전 최적화(_prev_gray 재사용)는 EIS ON 시 좌표계 불일치 유발:
+            #   _prev_gray = ORIGINAL 프레임 gray → corners = ORIGINAL 좌표
+            #   color_image = STABILIZED → 그리기 위치 5~10px 어긋남
+            # 300KB + 1ms 비용을 지불하고 좌표 일관성 보장
+            gray_img = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
             corners, ids, _ = _aruco_detect(gray_img)
 
             if ids is not None and len(ids) > 0:
