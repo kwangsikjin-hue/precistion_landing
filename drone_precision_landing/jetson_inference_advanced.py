@@ -1151,7 +1151,9 @@ try:
                 #   az 체크 전에 그린 후 → 나중에 aruco_pose=None 처리
                 #   → YOLO 텍스트(녹/주/파)와 ArUco 텍스트(황)가 동시 표시됨
                 if az >= DEPTH_MIN_M:
-                    # az 유효: 마커 윤곽·3D 축·ID 텍스트 모두 표시
+                    # az 유효: 마커 윤곽·3D 축만 마커 위치에 표시
+                    # ID 텍스트는 마커 위치 기준 제거 → 고정 위치 SRC 텍스트에 통합
+                    # (마커 위치 기준 텍스트는 YOLO↔ArUco 전환 시 위치 점프 원인)
                     cv2.aruco.drawDetectedMarkers(color_image, corners, ids)
                     try:
                         cv2.drawFrameAxes(color_image, aruco_cam_mat, aruco_dist,
@@ -1159,19 +1161,10 @@ try:
                     except AttributeError:
                         cv2.aruco.drawAxis(color_image, aruco_cam_mat, aruco_dist,
                                            rvec, tvec, MARKER_SIZE_M * 0.4)
-                    # 황색 ID 텍스트 — az 유효할 때만 표시
-                    cv2.putText(color_image, f"ArUco ID:{mid}  Z:{az:.2f}m",
-                                (cx_a - 60, cy_a - 20),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
                     aruco_pose = (ax, ay, az, rvec, tvec, mid, cx_a, cy_a)
                 else:
-                    # az 무효 (너무 가깝거나 신뢰 불가): 경고 텍스트만 표시
-                    # YOLO 경로가 실행되도록 aruco_pose는 None 유지
+                    # az 무효: 마커 윤곽만 표시, YOLO 경로가 실행되도록 aruco_pose=None
                     cv2.aruco.drawDetectedMarkers(color_image, corners, ids)
-                    cv2.putText(color_image,
-                                f"ArUco ID:{mid}  Z:N/A(<{DEPTH_MIN_M*100:.0f}cm)",
-                                (cx_a - 60, cy_a - 20),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 100, 255), 1)
         scores  = raw_out[:, 4]
         vmask   = scores >= 0.3          # ByteTrack 저신뢰도 포함 최소 임계값
         vpreds  = raw_out[vmask]         # (N, 5) — score 0.3 이상 박스만
@@ -1227,18 +1220,17 @@ try:
                     lstm_pred.add(fx, fy, fz)
                     futures = lstm_pred.predict()
 
-                # ArUco 추적 중심 원 표시
+                # ArUco 추적 중심 원 표시 (마커 위치 시각 표시용, 텍스트 없음)
                 cv2.circle(color_image, (cx_a, cy_a), 7, (0, 255, 255), 2)
                 traj_log.update('ArUco', 0, fx, fy, fz, vx, vy, vz, speed)
-                # draw_info 고정 위치 (5, 93): YOLO/ByteTrack 경로와 동일한 위치
-                # 이전 (cx_a-80, cy_a+30)은 마커 위치에 따라 텍스트가 이동 →
-                # YOLO→ArUco 전환 시 텍스트가 "박스 아래 왼쪽으로 순간 이동"하는
-                # 원인이었음. 고정 위치로 변경하면 전환 시 텍스트 위치가 유지됨.
+                # draw_info 고정 위치 (5, 93): 모든 소스 공통
                 draw_info(color_image, 5, 93,
                           fx, fy, fz, vx, vy, vz, speed, (0,255,255))
+                # ArUco ID·거리를 고정 위치 SRC 텍스트에 통합
+                # (마커 위치 기준 텍스트 제거 → 위치 점프 현상 완전 차단)
                 cv2.putText(color_image,
-                            f"SRC:ArUco|{single_kf.model_info}",
-                            (5,20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,255), 1)
+                            f"SRC:ArUco ID:{mid} Z:{az:.2f}m|{single_kf.model_info}",
+                            (5,20), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0,255,255), 1)
 
                 if futures:
                     for k,(px_f,py_f,pz_f) in enumerate(futures):
