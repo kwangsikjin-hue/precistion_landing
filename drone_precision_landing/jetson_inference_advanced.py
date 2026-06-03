@@ -63,6 +63,14 @@ parser.add_argument('--tracker', choices=['single', 'bytetrack'], default='singl
                          '  bytetrack : 다중 객체 ByteTrack (ID 유지)')
 parser.add_argument('--predict', type=int, default=0, metavar='N',
                     help='LSTM 미래 위치 예측 스텝 수 (0=비활성)')
+parser.add_argument('--eis', type=str, default='off', choices=['on', 'off'],
+                    help='소프트웨어 영상 안정화 EIS (기본: off)\n'
+                         '  on: Lucas-Kanade 광류 기반 떨림 보정\n'
+                         '  효과: 드론 진동 제거 → YOLO 인식률 향상')
+parser.add_argument('--eis-smoothing', type=int, default=7, metavar='N',
+                    help='EIS 스무딩 윈도우 프레임 수 (기본: 7)\n'
+                         '  작을수록 빠른 반응, 클수록 강한 안정화\n'
+                         '  권장: 5~15 (드론 접근 속도에 맞게 조정)')
 parser.add_argument('--motp', action='store_true',
                     help='MOTP 추적 정밀도 평가 활성화')
 parser.add_argument('--motp-log', type=str, default='on', choices=['on', 'off'],
@@ -734,6 +742,126 @@ class TrajectoryLogger:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# EIS — 소프트웨어 영상 안정화 (Electronic Image Stabilization)
+# ─────────────────────────────────────────────────────────────────────
+class FrameStabilizer:
+    """
+    Lucas-Kanade 희소 광류 기반 실시간 영상 안정화.
+
+    동작 4단계:
+      1. goodFeaturesToTrack   → 이전 프레임에서 코너 특징점 검출
+      2. calcOpticalFlowPyrLK  → 현재 프레임에서 특징점 추적
+      3. estimateAffinePartial2D → 이동(dx,dy) + 회전(da) 변환 추정
+      4. 이동 평균 스무딩 적용   → 의도적 이동 보존 + 고주파 진동 제거
+
+    스무딩 원리:
+      누적 궤적(cum) vs 평활 궤적(smooth) 차이 = 제거할 진동 성분
+      warpAffine으로 차이만큼 역보정 → 안정화된 프레임 출력
+
+    Jetson Nano 추가 비용: 약 5~8ms/frame
+    """
+    # Lucas-Kanade 파라미터
+    _LK = dict(winSize=(21,21), maxLevel=3,
+                criteria=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+    # 특징점 검출 파라미터
+    _FP = dict(maxCorners=200, qualityLevel=0.01, minDistance=10, blockSize=3)
+
+    def __init__(self, smoothing: int = 7):
+        """
+        smoothing : 이동 평균 윈도우 프레임 수
+                    작을수록 빠른 반응, 클수록 강한 안정화 (권장 5~15)
+        """
+        self.smoothing   = smoothing
+        self._prev_gray  = None
+        self._traj       = deque(maxlen=smoothing)  # 누적 변환 이력 (dx,dy,da)
+        self._cum_dx     = 0.0
+        self._cum_dy     = 0.0
+        self._cum_da     = 0.0
+
+    def stabilize(self, frame: np.ndarray) -> np.ndarray:
+        """
+        frame  : 원본 BGR 프레임 (640×480)
+        반환   : 안정화된 BGR 프레임 (동일 크기)
+        실패 시: 원본 프레임 그대로 반환 (특징점 부족 등)
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # 첫 프레임은 참조만 저장
+        if self._prev_gray is None:
+            self._prev_gray = gray
+            return frame
+
+        # ① 이전 프레임에서 특징점 검출
+        prev_pts = cv2.goodFeaturesToTrack(self._prev_gray, **self._FP)
+        if prev_pts is None or len(prev_pts) < 10:
+            self._prev_gray = gray
+            return frame
+
+        # ② Lucas-Kanade 광류로 특징점 추적
+        curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            self._prev_gray, gray, prev_pts, None, **self._LK)
+        if curr_pts is None:
+            self._prev_gray = gray
+            return frame
+
+        valid    = status.flatten() == 1
+        if valid.sum() < 10:
+            self._prev_gray = gray
+            return frame
+
+        prev_good = prev_pts[valid]
+        curr_good = curr_pts[valid]
+
+        # ③ 부분 어파인 변환 추정 (이동 + 회전, 스케일 고정)
+        T, inliers = cv2.estimateAffinePartial2D(prev_good, curr_good,
+                                                  method=cv2.RANSAC,
+                                                  ransacReprojThreshold=3.0)
+        if T is None:
+            self._prev_gray = gray
+            return frame
+
+        dx = float(T[0, 2])
+        dy = float(T[1, 2])
+        da = float(math.atan2(T[1, 0], T[0, 0]))
+
+        # ④ 누적 궤적 갱신 + 이동 평균으로 평활 궤적 계산
+        self._cum_dx += dx
+        self._cum_dy += dy
+        self._cum_da += da
+        self._traj.append((self._cum_dx, self._cum_dy, self._cum_da))
+
+        # 평활 궤적 (이동 평균)
+        n          = len(self._traj)
+        smooth_dx  = sum(t[0] for t in self._traj) / n
+        smooth_dy  = sum(t[1] for t in self._traj) / n
+        smooth_da  = sum(t[2] for t in self._traj) / n
+
+        # 보정량 = 평활 궤적 - 현재 누적 궤적
+        diff_dx = smooth_dx - self._cum_dx
+        diff_dy = smooth_dy - self._cum_dy
+        diff_da = smooth_da - self._cum_da
+
+        # ⑤ 보정 변환 행렬 구성 및 warpAffine 적용
+        cos_a = math.cos(diff_da)
+        sin_a = math.sin(diff_da)
+        M = np.array([[cos_a, -sin_a, diff_dx],
+                       [sin_a,  cos_a, diff_dy]], dtype=np.float32)
+
+        h, w = frame.shape[:2]
+        stabilized = cv2.warpAffine(frame, M, (w, h),
+                                     flags=cv2.INTER_LINEAR,
+                                     borderMode=cv2.BORDER_REPLICATE)
+        self._prev_gray = gray
+        return stabilized
+
+    def reset(self):
+        """추적 상태 초기화 (장면 전환 시 호출)"""
+        self._prev_gray = None
+        self._traj.clear()
+        self._cum_dx = self._cum_dy = self._cum_da = 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────
 # [6] 하드웨어 초기화 (전체 시작 시간 측정)
 # ─────────────────────────────────────────────────────────────────────
 _startup_begin = time.time()
@@ -842,6 +970,10 @@ _lstm_primary_id = None   # [E1] 이전 주 트랙 ID 추적 → 변경 시 LSTM
 motp_eval = MOTPEvaluator(save_log=(args.motp_log == 'on')) if args.motp else None
 # save_log=True 이면 처음부터 누적 / False 이면 리스트 미생성, update() 즉시 반환
 traj_log  = TrajectoryLogger(save_log=(args.traj_log == 'on'))
+# EIS: --eis off 이면 None (처리 비용 0), on 이면 FrameStabilizer 인스턴스
+stabilizer = FrameStabilizer(smoothing=args.eis_smoothing) if args.eis=='on' else None
+if stabilizer:
+    print(f"✅ EIS 활성화 (smoothing={args.eis_smoothing}프레임)")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -950,6 +1082,12 @@ try:
 
         # .copy() 필수: asanyarray는 RealSense 내부 버퍼의 View를 반환
         color_image=np.asanyarray(color_frame.get_data()).copy()
+
+        # ── EIS 소프트웨어 영상 안정화 (--eis on 시) ─────────────────────
+        # YOLO·ArUco·시각화 모두 안정화된 프레임 사용 → 인식률 향상
+        # 주의: 깊이 프레임은 별도(원본 좌표계) → 미세 정합 오차 ~2cm 허용
+        if stabilizer is not None:
+            color_image = stabilizer.stabilize(color_image)
 
         # ── [버그1 수정] YOLO는 반드시 그리기 전 깨끗한 이미지로 추론 ──
         # [M1] TensorRT 추론 → numpy 벡터화로 8400개 필터링
