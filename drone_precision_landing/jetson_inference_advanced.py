@@ -1162,10 +1162,12 @@ try:
             corners_half, ids, _ = _aruco_detect(_gray_half)
 
             # 절반 해상도 코너 → 원본 해상도 좌표로 복원 (×2)
+            # float32 유지: c * 2.0 시 float64로 업캐스팅 → drawDetectedMarkers 오류
+            # float32 명시 캐스팅으로 OpenCV 타입 호환성 보장
             if corners_half is not None and len(corners_half) > 0:
-                corners = [c * 2.0 for c in corners_half]
+                corners = [(c * 2).astype(np.float32) for c in corners_half]
             else:
-                corners = corners_half
+                corners = None   # 명시적 None (ids 체크로 보호됨)
 
             if ids is not None and len(ids) > 0:
                 # 가장 큰(가까운) 마커 선택
