@@ -647,27 +647,41 @@ class LSTMPredictor:
 # [5] MOTP 평가기
 # ─────────────────────────────────────────────────────────────────────
 class MOTPEvaluator:
-    """MOTP ≈ Σ(innovation_norm) / Σ(count). 값이 작을수록 추적 정밀도 높음."""
-    def __init__(self):
-        self.total_d=0.0; self.total_c=0; self.frame=0; self._log=[]
+    """
+    MOTP ≈ Σ(innovation_norm) / Σ(count). 값이 작을수록 추적 정밀도 높음.
+    save_log=False 이면 _log 리스트 자체를 채우지 않음 →
+    --motp-log off 시 처음부터 메모리 낭비 없음.
+    """
+    _LOG_MAX = 18000   # 최대 보관 항목 수 (30fps×10분=18000)
 
-    _LOG_MAX=18000  # 최대 보관 항목 수 (30fps×10분=18000)
+    def __init__(self, save_log: bool = True):
+        self.total_d  = 0.0
+        self.total_c  = 0
+        self.frame    = 0
+        self._save_log = save_log   # False 이면 _log 비활성
+        self._log     = [] if save_log else None   # None 으로 할당 자체 차단
 
     def update(self, innov):
-        self.total_d+=innov; self.total_c+=1; self.frame+=1
-        self._log.append((self.frame,round(innov*100,3)))
-        # [C5 수정] 무제한 메모리 성장 방지 — 초과 시 앞부분 절반 삭제
-        if len(self._log)>self._LOG_MAX:
-            self._log=self._log[self._LOG_MAX//2:]
+        self.total_d += innov
+        self.total_c += 1
+        self.frame   += 1
+        if self._save_log:
+            # 저장 옵션일 때만 _log 누적 (off 시 처음부터 append 자체 안 함)
+            self._log.append((self.frame, round(innov * 100, 3)))
+            if len(self._log) > self._LOG_MAX:
+                self._log = self._log[self._LOG_MAX // 2:]
 
     @property
-    def motp_m(self): return self.total_d/self.total_c if self.total_c else 0.0
+    def motp_m(self): return self.total_d / self.total_c if self.total_c else 0.0
 
     def text(self): return f"MOTP:{self.motp_m*100:.2f}cm (N={self.total_c})"
 
     def save(self, path='motp_log.csv'):
-        with open(path,'w',newline='') as f:
-            csv.writer(f).writerows([['frame','innovation_cm']]+self._log)
+        if not self._save_log or self._log is None:
+            print("ℹ️  MOTP CSV 저장 skipped (--motp-log off)")
+            return
+        with open(path, 'w', newline='') as f:
+            csv.writer(f).writerows([['frame', 'innovation_cm']] + self._log)
         print(f"📊 MOTP 로그 → {path}")
 
 
@@ -775,7 +789,8 @@ byte_tracker = ByteTracker(match_thresh=0.7, max_lost=15) if args.tracker=='byte
 track_3d_kfs = {}   # {track_id: KFModel3D}
 
 lstm_pred = LSTMPredictor(args.predict) if args.predict>0 else None
-motp_eval = MOTPEvaluator()             if args.motp       else None
+# save_log=True → 처음부터 _log 누적 / False → _log 비활성, 마지막 저장도 없음
+motp_eval = MOTPEvaluator(save_log=(args.motp_log == 'on')) if args.motp else None
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1192,12 +1207,9 @@ except Exception as e:
     print(f"\n메인 루프 실행 중 오류 발생: {e}")
 finally:
     print("시스템 자원을 해제합니다...")
-    if motp_eval and motp_eval.total_c>0:
+    if motp_eval and motp_eval.total_c > 0:
         print(f"📊 최종 {motp_eval.text()}")
-        if args.motp_log == 'on':
-            motp_eval.save()   # motp_log.csv 저장
-        else:
-            print("ℹ️  MOTP CSV 저장 skipped (--motp-log off)")
+        motp_eval.save()   # save_log=False 이면 내부에서 자동 스킵
     pipeline.stop()
     cv2.destroyAllWindows()
     if ENABLE_STREAMING and out is not None and out.isOpened():
