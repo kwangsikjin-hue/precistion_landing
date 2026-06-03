@@ -877,12 +877,15 @@ try:
         depth_frame=hole_fill.process(depth_frame).as_depth_frame()
 
         # .copy() 필수: asanyarray는 RealSense 내부 버퍼의 View를 반환
-        # copy 없이 그리면 버퍼가 오염 → 다음 프레임에 잔상·중복 발생
         color_image=np.asanyarray(color_frame.get_data()).copy()
 
-        # ── ArUco 마커 탐지 (YOLO와 독립 실행, --aruco on 시) ─────────
-        # 우선순위: ArUco > YOLO+depth > YOLO(FOV)
-        # ArUco tvec = 카메라 기준 3D 오프셋(m), 깊이 센서 불필요
+        # ── [버그1 수정] YOLO는 반드시 그리기 전 깨끗한 이미지로 추론 ──
+        # ArUco가 color_image에 먼저 그린 뒤 YOLO를 실행하면
+        # YOLO가 그려진 선·박스를 착륙 패드로 오탐 → 중복 바운딩박스 발생
+        # [M1] TensorRT 추론 → numpy 벡터화로 8400개 필터링
+        raw_out = trt_brain.infer(color_image).reshape(5, 8400).T  # (8400, 5)
+
+        # ── ArUco 마커 탐지 (YOLO 추론 완료 후 그리기) ─────────────────
         aruco_pose = None   # (ax, ay, az, rvec, tvec, marker_id, cx_a, cy_a)
 
         if _aruco_detect is not None:
@@ -890,7 +893,7 @@ try:
             corners, ids, _ = _aruco_detect(gray_img)
 
             if ids is not None and len(ids) > 0:
-                # 모든 탐지 마커 윤곽선 그리기
+                # 모든 탐지 마커 윤곽선 그리기 (YOLO 추론 후 안전)
                 cv2.aruco.drawDetectedMarkers(color_image, corners, ids)
 
                 # 가장 큰(가까운) 마커 선택
@@ -924,11 +927,6 @@ try:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
 
                 aruco_pose = (ax, ay, az, rvec, tvec, mid, cx_a, cy_a)
-
-        # [M1] TensorRT 추론 → numpy 벡터화로 8400개 필터링
-        # 원본: Python for 루프 8400회 → ~5~15ms 지연
-        # 수정: numpy 마스킹+슬라이싱 → ~0.1ms
-        raw_out = trt_brain.infer(color_image).reshape(5, 8400).T  # (8400, 5)
         scores  = raw_out[:, 4]
         vmask   = scores >= 0.3          # ByteTrack 저신뢰도 포함 최소 임계값
         vpreds  = raw_out[vmask]         # (N, 5) — score 0.3 이상 박스만
@@ -1081,19 +1079,40 @@ try:
                     angle_x=math.atan2(fx,fz); angle_y=math.atan2(fy,fz)
 
                     if motp_eval: motp_eval.update(innov)
-                    draw_info(color_image,tlbr[0],tlbr[1],fx,fy,fz,vx,vy,vz,speed,col)
+                    # [버그2 수정] draw_info는 primary 결정 후 한 번만 호출
+                    # 모든 트랙에서 호출하면 트랙 수만큼 텍스트 중복 표시됨
 
                     if primary is None or track.score>primary[0]:
                         primary=(track.score,tid,fx,fy,fz,vx,vy,vz,innov,angle_x,angle_y,dv)
                 else:
                     cv2.putText(color_image,"Depth:N/A",
                                 (tlbr[0],tlbr[1]-20),cv2.FONT_HERSHEY_SIMPLEX,0.4,(0,0,255),1)
-                    # 깊이 없어도 FOV 각도로 주 트랙 후보
                     if primary is None or track.score>primary[0]:
                         primary=(track.score,tid,0,0,0,0,0,0,0,angle_x,angle_y,0.0)
 
             if primary:
                 sc,ptid,fx,fy,fz,vx,vy,vz,innov,angle_x,angle_y,dv=primary
+
+                # [버그3 수정] ArUco 보정: for 루프에서 이미 업데이트된 트랙 KF를
+                # 다시 update() 호출하지 않음 — 위치·각도만 교체
+                if aruco_pose is not None and dv > 0:
+                    ax,ay,az,_,_,mid,cx_a,cy_a = aruco_pose
+                    pix_x = int(fx*intrinsics.fx/max(fz,0.01)+intrinsics.ppx)
+                    if abs(cx_a - pix_x) < 150:
+                        # KF 이중 업데이트 없이 ArUco 각도만 교체
+                        angle_x = math.atan2(ax, az)
+                        angle_y = math.atan2(ay, az)
+                        dv      = az
+                        cv2.putText(color_image,
+                                    f"ArUco refined ID:{mid}",
+                                    (cx_a-50, cy_a-40),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2)
+
+                # [버그2 수정] draw_info: primary 트랙만 1회 호출
+                col_p = track_color(ptid)
+                if dv > 0:
+                    speed_p = math.sqrt(vx**2+vy**2+vz**2)
+                    draw_info(color_image, 5, 80, fx, fy, fz, vx, vy, vz, speed_p, col_p)
 
                 # LSTM — 주 트랙만 적용
                 if lstm_pred and dv>0:
@@ -1106,21 +1125,6 @@ try:
                                 a=1.0-k/len(futures)
                                 cv2.circle(color_image,pix,max(2,int(5*a)),
                                            (int(255*a),int(100*a),255),-1)
-
-                # ArUco 탐지 시 주 트랙 위치에서 추가 정밀 보정
-                if aruco_pose is not None:
-                    ax,ay,az,_,_,mid,cx_a,cy_a = aruco_pose
-                    # 주 트랙 중심과 ArUco 중심이 150px 이내면 ArUco pose로 보정
-                    if abs(cx_a-int(fx*intrinsics.fx/max(fz,0.01)+intrinsics.ppx))<150:
-                        fx_a,fy_a,fz_a,vx,vy,vz,innov2 = \
-                            track_3d_kfs.get(ptid, single_kf).update(ax, ay, az)
-                        angle_x = math.atan2(fx_a, fz_a)
-                        angle_y = math.atan2(fy_a, fz_a)
-                        dv      = az
-                        cv2.putText(color_image,
-                                    f"ArUco refined ID:{mid}",
-                                    (cx_a-50, cy_a-40),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2)
 
                 send_mavlink(angle_x,angle_y,dv)
                 pos_str=(f"X:{fx*100:.1f} Y:{fy*100:.1f} Z:{fz*100:.1f}cm"
