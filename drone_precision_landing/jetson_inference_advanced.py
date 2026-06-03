@@ -65,11 +65,20 @@ parser.add_argument('--predict', type=int, default=0, metavar='N',
                     help='LSTM 미래 위치 예측 스텝 수 (0=비활성)')
 parser.add_argument('--motp', action='store_true',
                     help='MOTP 추적 정밀도 평가 활성화')
+parser.add_argument('--mav', type=str, default='udpin:0.0.0.0:14551',
+                    help='MAVLink 연결 주소 (기본: udpin:0.0.0.0:14551)\n'
+                         '  예) SITL PC:       --mav udpout:192.168.0.10:14550\n'
+                         '      특정 인터페이스: --mav udpin:192.168.0.5:14551\n'
+                         '      USB-UART:       --mav /dev/ttyUSB0\n'
+                         '  ※ udpout은 Jetson이 FC에 먼저 연결 → Heartbeat 빠름')
+parser.add_argument('--mav-timeout', type=int, default=3, metavar='SEC',
+                    help='MAVLink Heartbeat 대기 타임아웃 초 (기본: 3)')
 args = parser.parse_args()
 
 ENABLE_STREAMING = (args.stream == 'on')
 print(f"[설정] 스트리밍={args.stream} | 모델={args.model.upper()} | "
-      f"추적={args.tracker} | LSTM={args.predict}스텝 | MOTP={args.motp}")
+      f"추적={args.tracker} | LSTM={args.predict}스텝 | MOTP={args.motp} | "
+      f"MAVLink={args.mav}")
 
 # ─────────────────────────────────────────────────────────────────────
 # GStreamer 스트리밍 초기화
@@ -100,18 +109,17 @@ else:
 # MAVLink 비행 제어기 연결
 # ─────────────────────────────────────────────────────────────────────
 try:
-    # timeout=3으로 단축 (원본 5초 → 3초, FC 미연결 시 대기 시간 감소)
-    print("⏳ MAVLink 연결 시도 중... (최대 3초 대기)")
-    master = mavutil.mavlink_connection('udpin:0.0.0.0:14551')
-    msg = master.recv_match(type='HEARTBEAT', blocking=True, timeout=3)
+    print(f"⏳ MAVLink 연결 시도 중... [{args.mav}] (최대 {args.mav_timeout}초 대기)")
+    master = mavutil.mavlink_connection(args.mav)
+    msg = master.recv_match(type='HEARTBEAT', blocking=True, timeout=args.mav_timeout)
     if msg:
-        print("🛸 [성공] ArduPilot FC MAVLink 연결 완료!")
+        print(f"🛸 [성공] ArduPilot FC MAVLink 연결 완료! [{args.mav}]")
     else:
         # [M4] 타임아웃 시 master=None
-        print("⚠️ [경고] 3초간 Heartbeat 없음 — master=None 처리 후 영상 처리만 진행합니다.")
+        print(f"⚠️ [경고] {args.mav_timeout}초간 Heartbeat 없음 — master=None 처리 후 영상 처리만 진행합니다.")
         master = None
 except Exception as e:
-    print(f"⚠️ FC 연결 실패: {e}")
+    print(f"⚠️ FC 연결 실패 [{args.mav}]: {e}")
     master = None
 
 MAVLINK_SEND_HZ = 10
