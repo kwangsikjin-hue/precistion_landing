@@ -68,7 +68,12 @@ parser.add_argument('--motp', action='store_true',
 parser.add_argument('--motp-log', type=str, default='on', choices=['on', 'off'],
                     help='MOTP 결과 CSV 파일 저장 여부 (기본: on)\n'
                          '  on : 종료 시 motp_log.csv 자동 저장\n'
-                         '  off: 화면 표시만, 파일 저장 안 함')
+                         '  off: 화면 표시만, 처음부터 _log 누적 안 함')
+parser.add_argument('--traj-log', type=str, default='off', choices=['on', 'off'],
+                    help='주 트랙 궤적 CSV 저장 여부 (기본: off)\n'
+                         '  on : 종료 시 trajectory_log.csv 저장\n'
+                         '  off: 처음부터 궤적 데이터 누적 안 함\n'
+                         '  컬럼: time_s, source, track_id, x,y,z(m), vx,vy,vz(m/s), speed')
 parser.add_argument('--mav', type=str, default='udpin:0.0.0.0:14551',
                     help='MAVLink 연결 주소 (기본: udpin:0.0.0.0:14551)\n'
                          '  예) SITL PC:       --mav udpout:192.168.0.10:14550\n'
@@ -686,6 +691,49 @@ class MOTPEvaluator:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# 궤적 로그 (TrajectoryLogger)
+# ─────────────────────────────────────────────────────────────────────
+class TrajectoryLogger:
+    """
+    주 트랙의 위치·속도 이력을 CSV로 저장하는 로거.
+    save_log=False 이면 처음부터 데이터 누적 자체를 차단 (메모리·CPU 낭비 없음).
+    컬럼: time_s, source, track_id, x_m, y_m, z_m, vx, vy, vz, speed_mps
+    """
+    _LOG_MAX = 54000   # 최대 보관 항목 수 (30fps × 30분)
+
+    def __init__(self, save_log: bool = False):
+        self._save_log = save_log
+        self._log      = [] if save_log else None   # off 이면 리스트 자체 미생성
+
+    def update(self, source: str, track_id: int,
+               fx: float, fy: float, fz: float,
+               vx: float, vy: float, vz: float, speed: float):
+        if not self._save_log:
+            return   # off 이면 처음부터 아무것도 하지 않음
+        self._log.append((
+            round(time.time(), 3),
+            source, track_id,
+            round(fx, 4), round(fy, 4), round(fz, 4),
+            round(vx, 4), round(vy, 4), round(vz, 4),
+            round(speed, 4)
+        ))
+        if len(self._log) > self._LOG_MAX:
+            self._log = self._log[self._LOG_MAX // 2:]
+
+    def save(self, path='trajectory_log.csv'):
+        if not self._save_log or self._log is None:
+            return   # off 이면 저장 없이 조용히 종료
+        with open(path, 'w', newline='') as f:
+            csv.writer(f).writerows(
+                [['time_s', 'source', 'track_id',
+                  'x_m', 'y_m', 'z_m',
+                  'vx_mps', 'vy_mps', 'vz_mps', 'speed_mps']]
+                + self._log
+            )
+        print(f"📋 궤적 로그 → {path}  ({len(self._log)}행)")
+
+
+# ─────────────────────────────────────────────────────────────────────
 # [6] 하드웨어 초기화 (전체 시작 시간 측정)
 # ─────────────────────────────────────────────────────────────────────
 _startup_begin = time.time()
@@ -791,6 +839,8 @@ track_3d_kfs = {}   # {track_id: KFModel3D}
 lstm_pred = LSTMPredictor(args.predict) if args.predict>0 else None
 # save_log=True → 처음부터 _log 누적 / False → _log 비활성, 마지막 저장도 없음
 motp_eval = MOTPEvaluator(save_log=(args.motp_log == 'on')) if args.motp else None
+# save_log=True 이면 처음부터 누적 / False 이면 리스트 미생성, update() 즉시 반환
+traj_log  = TrajectoryLogger(save_log=(args.traj_log == 'on'))
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1007,6 +1057,7 @@ try:
                     lstm_pred.add(fx, fy, fz)
                     futures = lstm_pred.predict()
 
+                traj_log.update('ArUco', 0, fx, fy, fz, vx, vy, vz, speed)
                 draw_info(color_image, cx_a-80, cy_a+30,
                           fx, fy, fz, vx, vy, vz, speed, (0,255,255))
                 cv2.putText(color_image,
@@ -1045,6 +1096,7 @@ try:
                     angle_x=math.atan2(fx,fz); angle_y=math.atan2(fy,fz)
 
                     if motp_eval: motp_eval.update(innov)
+                    traj_log.update('YOLO', 0, fx, fy, fz, vx, vy, vz, speed)
                     futures=None
                     if lstm_pred:
                         lstm_pred.add(fx,fy,fz)
@@ -1153,6 +1205,7 @@ try:
                 col_p = track_color(ptid)
                 if dv > 0:
                     speed_p = math.sqrt(vx**2+vy**2+vz**2)
+                    traj_log.update('ByteTrack', ptid, fx, fy, fz, vx, vy, vz, speed_p)
                     draw_info(color_image, 5, 130, fx, fy, fz, vx, vy, vz, speed_p, col_p)
 
                 # LSTM — 주 트랙만 적용
@@ -1209,7 +1262,8 @@ finally:
     print("시스템 자원을 해제합니다...")
     if motp_eval and motp_eval.total_c > 0:
         print(f"📊 최종 {motp_eval.text()}")
-        motp_eval.save()   # save_log=False 이면 내부에서 자동 스킵
+        motp_eval.save()        # save_log=False 이면 내부에서 자동 스킵
+    traj_log.save()             # save_log=False 이면 조용히 종료 (메시지 없음)
     pipeline.stop()
     cv2.destroyAllWindows()
     if ENABLE_STREAMING and out is not None and out.isOpened():
