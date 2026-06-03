@@ -201,9 +201,15 @@ class JetsonTRTEngine:
                 self.cuda_lib.cudaFree(p)
 
     def infer(self, img):
-        img_in = np.ascontiguousarray(
-            cv2.resize(img,(640,640)).transpose(2,0,1).astype(np.float32)/255.0
-        )[np.newaxis]
+        # cv2.dnn.blobFromImage: C++ 단일 패스로 resize+normalize+CHW 변환
+        # 기존 numpy 체인(resize→transpose→astype→/255)은 중간 배열 3개 생성
+        # blobFromImage는 단일 C++ 루프로 처리 → 1~3ms 절약
+        # 반환: (1,3,640,640) float32, 연속 배열 (np.ascontiguousarray 불필요)
+        img_in = cv2.dnn.blobFromImage(img, scalefactor=1/255.0,
+                                        size=(640, 640),
+                                        mean=(0, 0, 0),
+                                        swapRB=False,   # BGR 채널 순서 유지
+                                        crop=False)     # 640×640으로 stretch
         np.copyto(self.inputs[0]['host'], img_in)
         self.cuda_lib.cudaMemcpy(
             ctypes.c_void_p(self.inputs[0]['device']),
