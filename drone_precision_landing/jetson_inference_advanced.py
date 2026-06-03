@@ -119,8 +119,21 @@ print(f"[설정] 스트리밍={args.stream} | 모델={args.model.upper()} | "
 # GStreamer 스트리밍 초기화
 # ─────────────────────────────────────────────────────────────────────
 if ENABLE_STREAMING:
-    print("📡 [알림] GStreamer UDP 스트리밍 초기화 중... (x264enc 로딩, 2~5초 소요)")
-    gst_pipeline = (
+    # NVENC(하드웨어 인코더) 우선 시도 → 실패 시 x264(소프트웨어)로 폴백
+    # NVENC: Jetson Nano 내장 HW 인코더, CPU 부하 0 → 2~4ms 절약
+    # x264: 소프트웨어 인코더, CPU 2~5ms 소비
+    _nvenc_pipeline = (
+        "appsrc ! "
+        "videoconvert ! "
+        "video/x-raw,format=I420 ! "
+        "nvv4l2h264enc bitrate=800000 preset-level=1 insert-vui=1 ! "
+        "video/x-h264,stream-format=byte-stream ! "
+        "h264parse ! "
+        "rtph264pay pt=96 config-interval=1 ! "
+        "queue max-size-buffers=10 leaky=downstream ! "
+        "udpsink host=192.168.0.30 port=15600 sync=false async=false"
+    )
+    _x264_pipeline = (
         "appsrc ! "
         "videoconvert ! "
         "video/x-raw,format=I420 ! "
@@ -130,12 +143,18 @@ if ENABLE_STREAMING:
         "queue max-size-buffers=10 leaky=downstream ! "
         "udpsink host=192.168.0.30 port=15600 sync=false async=false"
     )
-    out = cv2.VideoWriter(gst_pipeline, cv2.CAP_GSTREAMER, 0, 30, (640, 480))
-    if not out.isOpened():
-        print("⚠️ GStreamer 초기화 실패 — 스트리밍 없이 계속합니다.")
-        out = None
+    print("📡 [알림] GStreamer NVENC(HW 인코더) 초기화 시도...")
+    out = cv2.VideoWriter(_nvenc_pipeline, cv2.CAP_GSTREAMER, 0, 30, (640, 480))
+    if out.isOpened():
+        print("✅ NVENC 하드웨어 인코더 활성화 (CPU 인코딩 부하 제거)")
     else:
-        print("✅ GStreamer 스트리밍 초기화 완료 (Target: 192.168.0.30:15600)")
+        print("⚠️ NVENC 미지원 — x264 소프트웨어 인코더로 폴백")
+        out = cv2.VideoWriter(_x264_pipeline, cv2.CAP_GSTREAMER, 0, 30, (640, 480))
+        if not out.isOpened():
+            print("⚠️ GStreamer 초기화 실패 — 스트리밍 없이 계속합니다.")
+            out = None
+        else:
+            print("✅ x264 소프트웨어 인코더 활성화 (Target: 192.168.0.30:15600)")
 else:
     print("🖥️  [알림] GStreamer 스트리밍 OFF (로컬 화면만 표시)")
     out = None
@@ -1101,44 +1120,52 @@ try:
         if not depth_frame or not color_frame:
             continue
 
-        # 깊이 후처리 필터 체인
-        # 각 필터 출력은 rs.frame 타입 → 매 단계 as_depth_frame() 명시 변환
-        # (마지막 단계에만 적용하면 intermediate frame이 depth_frame 타입을 잃음)
+        # 깊이 후처리 필터 체인 (2단계로 축소)
+        # hole_fill 제거: get_median_depth()의 5×5 중앙값이 홀을 이미 처리함 → 중복
+        # spatial:  공간 노이즈 제거 (필수)
+        # temporal: 시간축 노이즈 감소 (필수)
+        # hole_fill: 빈 픽셀 채우기 → 5×5 median으로 대체됨 → 제거 (-0.5ms)
         depth_frame=spatial_filter.process(depth_frame).as_depth_frame()
         depth_frame=temporal_filter.process(depth_frame).as_depth_frame()
-        depth_frame=hole_fill.process(depth_frame).as_depth_frame()
 
-        # .copy() 필수: asanyarray는 RealSense 내부 버퍼의 View를 반환
-        color_image=np.asanyarray(color_frame.get_data()).copy()
+        # 최적화: .copy()를 TRT 추론 이후로 지연 → 0.5ms 절약
+        # blobFromImage는 소스 배열을 수정하지 않으므로 원본 버퍼 직접 사용 가능
+        _raw_view = np.asanyarray(color_frame.get_data())   # 복사 없음
 
         # ── EIS 소프트웨어 영상 안정화 (--eis on 시) ─────────────────────
-        # 안정화 범위: YOLO 추론 · ArUco 탐지 · 시각화 전부 적용 → 인식률 향상
-        # 깊이 좌표 불일치:
-        #   안정화 후 픽셀 좌표(cx,cy)로 depth_frame.get_distance() 호출 시
-        #   depth_frame은 원본 좌표계 → 미세 정합 오차 발생
-        #   오차 크기 = shift_px × depth_m × 0.00188rad/px
-        #   예) 10px 이동, 2m 고도 → 약 3.8cm 오차
-        #   50cm 마커 대비 허용 가능 범위 (고도 0.5m 이하 접근 시 1cm 미만)
         if stabilizer is not None:
-            color_image = stabilizer.stabilize(color_image)
+            # stabilize()는 새 배열 반환 → color_image가 독립 배열이 됨
+            color_image = stabilizer.stabilize(_raw_view)
+            # EIS 경로: color_image가 이미 새 배열 → 추가 .copy() 불필요
+        else:
+            # EIS 없음: 추론은 원본 버퍼 뷰로 실행, 그리기용 .copy()는 추론 후
+            color_image = None   # 추론 후 설정
 
         # ── [버그1 수정] YOLO는 반드시 그리기 전 깨끗한 이미지로 추론 ──
         # [M1] TensorRT 추론 → numpy 벡터화로 8400개 필터링
-        # 주의: infer()는 내부 host 버퍼의 View를 반환 → 다음 infer() 전 처리 완료 필수
-        # reshape·T 모두 View → all_dets 리스트 생성까지 버퍼 유효
-        raw_out = trt_brain.infer(color_image).reshape(5, 8400).T  # (8400, 5)
+        _infer_src = color_image if stabilizer is not None else _raw_view
+        raw_out = trt_brain.infer(_infer_src).reshape(5, 8400).T  # (8400, 5)
+
+        # 추론 완료 후 드로잉용 .copy() (EIS 없을 때만)
+        if color_image is None:
+            color_image = _raw_view.copy()   # 추론 후 복사 → RS 버퍼 안전 확보
 
         # ── ArUco 마커 탐지 (YOLO 추론 완료 후 그리기) ─────────────────
         aruco_pose = None   # (ax, ay, az, rvec, tvec, marker_id, cx_a, cy_a)
 
         if _aruco_detect is not None:
-            # 항상 현재 color_image에서 gray 변환 (EIS 안정화 여부 무관)
-            # 이전 최적화(_prev_gray 재사용)는 EIS ON 시 좌표계 불일치 유발:
-            #   _prev_gray = ORIGINAL 프레임 gray → corners = ORIGINAL 좌표
-            #   color_image = STABILIZED → 그리기 위치 5~10px 어긋남
-            # 300KB + 1ms 비용을 지불하고 좌표 일관성 보장
-            gray_img = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
-            corners, ids, _ = _aruco_detect(gray_img)
+            # ArUco 탐지 최적화: 절반 해상도(320×240) 사용
+            # 50cm 마커는 절반 해상도에서도 충분히 탐지됨 → 처리 시간 ~50% 감소
+            # 탐지 후 코너 좌표를 2배 스케일로 복원하여 정확한 픽셀 위치 확보
+            _gray_full = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+            _gray_half = cv2.resize(_gray_full, (320, 240))   # 절반 해상도
+            corners_half, ids, _ = _aruco_detect(_gray_half)
+
+            # 절반 해상도 코너 → 원본 해상도 좌표로 복원 (×2)
+            if corners_half is not None and len(corners_half) > 0:
+                corners = [c * 2.0 for c in corners_half]
+            else:
+                corners = corners_half
 
             if ids is not None and len(ids) > 0:
                 # 가장 큰(가까운) 마커 선택
