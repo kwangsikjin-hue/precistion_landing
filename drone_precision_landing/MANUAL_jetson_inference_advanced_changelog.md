@@ -2,7 +2,7 @@
 
 **파일:** `drone_precision_landing/jetson_inference_advanced.py`  
 **원본:** `drone_precision_landing/jetson_inference.py`  
-**최종 커밋:** `c579a1a`  
+**최종 커밋:** `42518bd`  
 **작성일:** 2026-06-03
 
 ---
@@ -42,8 +42,13 @@
 | `3c6c901` | feat | 2건 | `TrajectoryLogger` 추가 — `--traj-log on/off` |
 | `76d05ef` | fix | 1건 | ByteTrack `draw_info` y 위치 조정 (y_top 130 → 93) |
 | `c579a1a` | fix | 5건 | 정밀 재분석 — LSTM 트랙 혼입·draw_info 충돌·캐시 정리 등 |
+| `ff944df` | feat | 3건 | EIS 소프트웨어 영상 안정화 (`--eis on/off`, `--eis-smoothing N`) |
+| `ab73cd8` | fix | 4건 | EIS FrameStabilizer 정밀 분석 — status None·inliers·초기 윈도우 |
+| `37fd016` | fix | 1건 | ArUco ID 황색 텍스트·YOLO 텍스트 동시 표시 버그 수정 |
+| `0e482a6` | fix | 1건 | EIS+ArUco gray 이중 변환 제거 (좌표 일관성 보장) |
+| `42518bd` | fix | 2건 | EIS+ArUco 좌표계 불일치 최종 수정 + CA 행렬 in-place 최적화 |
 
-**총 수정·개선: 56건**
+**총 수정·개선: 67건**
 
 ---
 
@@ -860,6 +865,129 @@ for tid in list(track_3d_kfs):
 
 ---
 
+### 커밋 `ff944df` — EIS 소프트웨어 영상 안정화 추가 (feat)
+
+드론 모터 진동으로 인한 카메라 떨림을 소프트웨어로 보정합니다.
+
+#### 동작 원리 (Lucas-Kanade 희소 광류)
+
+```
+① goodFeaturesToTrack   → 이전 프레임 코너 200개 검출
+② calcOpticalFlowPyrLK  → 현재 프레임에서 특징점 추적
+③ estimateAffinePartial2D + RANSAC → 이동(dx,dy)+회전(da) 추정
+④ 이동 평균 스무딩 (기본 7프레임) → 의도적 이동 보존, 고주파 진동 제거
+⑤ warpAffine            → 보정된 프레임 출력
+```
+
+#### 추가된 CLI 인수
+
+| 인수 | 기본값 | 설명 |
+|------|--------|------|
+| `--eis on/off` | `off` | EIS 활성화 |
+| `--eis-smoothing N` | `7` | 스무딩 윈도우 프레임 수 (권장 5~15) |
+
+#### 처리 비용 및 주의사항
+
+- Jetson Nano 추가 비용: **5~8ms/frame**
+- 깊이-색상 좌표 오차: shift_px × depth_m × 0.00188rad/px (예: 10px, 2m → 3.8cm)
+- 50cm 마커 대비 허용 범위 (저고도에서 1cm 미만)
+
+---
+
+### 커밋 `ab73cd8` — EIS FrameStabilizer 정밀 분석 4건 수정 (fix)
+
+| 항목 | 수정 내용 |
+|------|----------|
+| `status is None` 미체크 | `calcOpticalFlowPyrLK` 결과 `status=None` 시 `AttributeError` 크래시 방지 |
+| `inliers` 품질 미검증 | `inliers is None` 또는 `sum()<8` 시 변환 신뢰 불가로 원본 반환 |
+| 초기 윈도우 미충족 | `len(traj) < smoothing` 이면 평균 기준점 불충분 → 원본 반환 |
+| 깊이 오차 정량화 | 주석에 공식 명시: `shift × depth × 0.00188` |
+
+```python
+# 수정 전: curr_pts만 체크
+if curr_pts is None: return frame
+
+# 수정 후: status도 함께 체크
+if curr_pts is None or status is None: return frame
+
+# inliers 품질 검증 추가
+if T is None or inliers is None: return frame
+if int(inliers.sum()) < 8: return frame
+
+# 초기 윈도우 처리
+if len(self._traj) < self.smoothing: return frame
+```
+
+---
+
+### 커밋 `37fd016` — ArUco+YOLO 텍스트 동시 표시 버그 수정 (fix)
+
+#### 재현 조건
+
+`--aruco on` 실행 중 드론이 마커에 너무 가까이 접근 (`az < 0.15m`)하거나 거리 신뢰 불가 시 발생:
+
+```
+수정 전 실행 순서:
+  ① drawDetectedMarkers   ← az 체크 없이 항상 그림
+  ② drawFrameAxes          ← az 체크 없이 항상 그림
+  ③ 황색 "ArUco ID:" 텍스트 ← az 체크 없이 항상 그림!
+  ④ aruco_pose 설정
+
+  → 이후 az < DEPTH_MIN_M → aruco_pose=None
+  → YOLO 경로: 녹색/주황/파란 텍스트도 그림
+  → 두 세트 동시 표시 (증상)
+
+수정 후 실행 순서:
+  if az >= DEPTH_MIN_M:
+      → 마커 윤곽 + 3D 축 + 황색 ID + aruco_pose 설정
+  else:
+      → 마커 윤곽 + "Z:N/A" 경고만 → aruco_pose=None
+      → YOLO 경로가 깔끔하게 단독 실행
+```
+
+---
+
+### 커밋 `0e482a6` — EIS+ArUco gray 이중 변환 제거 (fix) [이후 재수정됨]
+
+EIS ON 시 `stabilizer._prev_gray` (ORIGINAL gray)를 ArUco에 재사용하여 변환 1회 제거를 시도했으나, 좌표계 불일치 문제 발견 → `42518bd`에서 최종 수정.
+
+---
+
+### 커밋 `42518bd` — EIS+ArUco 좌표계 불일치 최종 수정 + CA 행렬 최적화 (fix)
+
+#### 1. EIS+ArUco 좌표계 불일치 최종 수정 (critical)
+
+```python
+# 문제: _prev_gray = ORIGINAL 프레임 gray
+#        corners 좌표 = ORIGINAL 공간
+#        color_image = STABILIZED (EIS 적용)
+#        → 마커 오버레이 5~10px 어긋남
+
+# 수정 전 (잘못된 재사용):
+gray_img = stabilizer._prev_gray   # ORIGINAL gray → 좌표 불일치!
+
+# 수정 후 (항상 현재 이미지에서 변환):
+gray_img = cv2.cvtColor(color_image, ...)  # STABILIZED gray → 좌표 일치 ✓
+```
+
+#### 2. KFModelCA `_build_F()` in-place 최적화 (성능)
+
+```python
+# 수정 전: 매 프레임 9×9 행렬 신규 생성 (324B × 30fps = 10KB/s GC압력)
+def _build_F(self, dt):
+    F = np.eye(9, dtype=np.float32)  # 새 배열!
+    ...
+
+# 수정 후: 템플릿 재사용, dt 값만 in-place 교체
+def _update_F(self, dt):
+    F = self._F_template    # 기존 배열 재사용
+    F[i,i+3] = dt           # 값만 교체
+    F[i,i+6] = 0.5*dt*dt
+    F[i+3,i+6] = dt
+```
+
+---
+
 ## 3. 카테고리별 수정 항목 전체 목록
 
 ### 🔴 런타임 크래시 방지 (7건)
@@ -953,6 +1081,36 @@ for tid in list(track_3d_kfs):
 | `L3` | `3c6c901` | `TrajectoryLogger` + `--traj-log on/off` 추가 |
 | `L4` | `c579a1a` | `_color_cache` 소멸 트랙과 함께 정리 (메모리 누수 방지) |
 
+### 🟢 EIS 영상 안정화 (3건, `ff944df`)
+
+| 항목 | 내용 |
+|------|------|
+| `EIS1` | `--eis on/off` + `--eis-smoothing N` CLI 인수 추가 |
+| `EIS2` | `FrameStabilizer` 클래스 (Lucas-Kanade 광류 기반) |
+| `EIS3` | 안정화 프레임에 YOLO·ArUco 모두 적용, 5~8ms 추가 비용 |
+
+### 🟢 EIS 안정성 수정 (4건, `ab73cd8`)
+
+| 항목 | 내용 |
+|------|------|
+| `ES1` | `status is None` 미체크 → `AttributeError` 크래시 방지 |
+| `ES2` | `inliers` 품질 미검증 → `sum()<8` 시 원본 반환 |
+| `ES3` | 초기 smoothing 윈도우 미충족 시 원본 반환 |
+| `ES4` | 깊이 오차 공식 주석 명시 |
+
+### 🔴 ArUco+YOLO 텍스트 혼재 수정 (1건, `37fd016`)
+
+| 항목 | 내용 |
+|------|------|
+| `AT1` | az 유효성 체크를 그리기 전으로 이동 → 황색+녹/주/파 동시 표시 방지 |
+
+### 🔴 EIS+ArUco 좌표계 불일치 수정 (2건, `42518bd`)
+
+| 항목 | 내용 |
+|------|------|
+| `EC1` | ArUco gray를 항상 현재 `color_image`에서 변환 (STABILIZED 공간 일치) |
+| `EC2` | `KFModelCA._build_F()` in-place 교체 → 매 프레임 9×9 배열 신규 생성 제거 |
+
 ### 🩵 분석 발견 수정 (5건, `c579a1a`)
 
 | 항목 | 내용 |
@@ -1021,6 +1179,8 @@ for tid in list(track_3d_kfs):
 | `--aruco` | `off` | ArUco 마커 탐지 (`on` / `off`) |
 | `--aruco-dict` | `4X4_50` | ArUco 사전 (`4X4_50` / `5X5_100` / `6X6_250` / `7X7_1000`) |
 | `--marker-size` | `0.5` | 마커 실물 크기 미터 (현재 마커: 50cm×50cm) |
+| `--eis` | `off` | EIS 영상 안정화 (`on` / `off`) |
+| `--eis-smoothing` | `7` | EIS 스무딩 윈도우 프레임 수 (권장 5~15) |
 
 ---
 
@@ -1081,6 +1241,17 @@ python3 jetson_inference_advanced.py \
     --stream on --model cv --tracker bytetrack \
     --motp --motp-log off \
     --traj-log off
+
+# EIS + ArUco 최고 정밀 조합 (드론 진동 심할 때)
+python3 jetson_inference_advanced.py \
+    --stream on --model ctrv \
+    --aruco on --marker-size 0.5 \
+    --eis on --eis-smoothing 7 \
+    --mav udpout:192.168.0.10:14550
+
+# 타이밍 주의 (30fps 예산 초과 위험 조합)
+# TRT(25ms) + EIS(8ms) + GStreamer(5ms) = 38ms > 33ms
+# → --eis-smoothing 5 또는 --stream off 권장
 ```
 
 ---
@@ -1101,6 +1272,10 @@ python3 jetson_inference_advanced.py \
 | `cv2.aruco` 미설치 | `--aruco on` 해도 자동 비활성화 | `pip3 install opencv-contrib-python` |
 | ByteTrack 주 트랙 변경 | LSTM 버퍼 리셋 후 재학습 필요 (약 45프레임) | 정상 동작, 대기 |
 | `--traj-log on` 파일 크기 | 30fps×30분 = 54,000행 ≈ 수 MB | 적절한 비행 시간 설정 |
+| `--eis on` 타이밍 | EIS 5~8ms 추가 → TRT+GStreamer와 합산 시 30fps 초과 가능 | `--eis-smoothing 5` 또는 `--stream off` 권장 |
+| EIS 초기 워밍업 | smoothing(기본 7)프레임 동안 안정화 미적용 | 0.23초(약 7프레임) 후 자동 활성 |
+| EIS+depth 오차 | 안정화 픽셀 좌표로 깊이 조회 시 최대 ~4cm 오차 | 50cm 마커 대비 허용 범위 |
+| ArUco az 무효 시 | `--aruco on`이어도 az<15cm는 YOLO로 폴백 | 정상 동작, "Z:N/A" 경고 표시 |
 | Windows IDE 모듈 오류 | cv2, pyrealsense2 등 Not Found 표시 | Jetson Nano 환경에서만 정상 실행됨 — Windows Python 환경 오탐 |
 
 ---
@@ -1110,6 +1285,11 @@ python3 jetson_inference_advanced.py \
 ```
 git log --oneline drone_precision_landing/jetson_inference_advanced.py
 
+42518bd fix: 메모리·타이밍·간섭 전체 분석 결과 2건 수정
+0e482a6 fix: 메모리·타이밍·연결성 전체 분석 결과 수정
+37fd016 fix: ArUco ID 황색 텍스트가 YOLO 텍스트와 동시 표시되는 버그 수정
+ab73cd8 fix: EIS FrameStabilizer 정밀 분석 결과 4건 수정
+ff944df feat: EIS 소프트웨어 영상 안정화 추가 (--eis on/off, --eis-smoothing N)
 c579a1a fix: 정밀 재분석 결과 5건 수정
 76d05ef fix: ByteTrack draw_info 위치 조정 (y_top 130→93)
 3c6c901 feat: TrajectoryLogger 추가 — --traj-log on/off
@@ -1135,4 +1315,4 @@ a7e80b1 fix: ByteTrack 논리 버그 4건 및 안전성 개선 5건 수정
 
 ---
 
-*본 매뉴얼은 `jetson_inference_advanced.py` 커밋 `c579a1a` 기준으로 작성되었습니다.*
+*본 매뉴얼은 `jetson_inference_advanced.py` 커밋 `42518bd` 기준으로 작성되었습니다.*
