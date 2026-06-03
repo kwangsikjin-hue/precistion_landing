@@ -769,7 +769,9 @@ print(f"🚀 [성공] 전체 초기화 완료 — 총 소요시간: {_startup_se
 # [7] 인스턴스 생성
 # ─────────────────────────────────────────────────────────────────────
 single_kf    = create_tracker(args.model)
-byte_tracker = ByteTracker() if args.tracker=='bytetrack' else None
+# match_thresh: 0.8→0.7 (완화 — YOLO 위치 변동 시 매칭 실패로 중복 트랙 생성 방지)
+# max_lost: 30→15 (절반 단축 — 잘못 생성된 트랙을 빠르게 제거)
+byte_tracker = ByteTracker(match_thresh=0.7, max_lost=15) if args.tracker=='bytetrack' else None
 track_3d_kfs = {}   # {track_id: KFModel3D}
 
 lstm_pred = LSTMPredictor(args.predict) if args.predict>0 else None
@@ -943,12 +945,21 @@ try:
             y1s = ((yc - bh / 2) * (480 / 640)).astype(int)
             x2s = (xc + bw / 2).astype(int)
             y2s = ((yc + bh / 2) * (480 / 640)).astype(int)
-            # column_stack 시 sc(float)로 좌표가 float 업캐스팅되는 문제 방지
-            # → 좌표는 int, score는 float로 명시 분리
-            all_dets = [
+            raw_dets = [
                 [int(x1s[i]), int(y1s[i]), int(x2s[i]), int(y2s[i]), float(sc[i])]
                 for i in range(len(vpreds))
             ]
+            # NMS: 같은 객체에 대한 겹치는 박스 제거 → ByteTrack 중복 트랙 방지
+            # cv2.dnn.NMSBoxes 형식: (x,y,w,h)
+            nms_boxes  = [[d[0], d[1], d[2]-d[0], d[3]-d[1]] for d in raw_dets]
+            nms_scores = [d[4] for d in raw_dets]
+            nms_idx    = cv2.dnn.NMSBoxes(nms_boxes, nms_scores,
+                                           score_threshold=0.3,
+                                           nms_threshold=0.45)
+            if len(nms_idx) > 0:
+                all_dets = [raw_dets[i] for i in nms_idx.flatten()]
+            else:
+                all_dets = []
         else:
             all_dets = []
 
@@ -1123,10 +1134,11 @@ try:
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2)
 
                 # [버그2 수정] draw_info: primary 트랙만 1회 호출
+                # y=130 시작: "ByteTrack|..." 텍스트(y=20)와 75px 이상 간격 확보
                 col_p = track_color(ptid)
                 if dv > 0:
                     speed_p = math.sqrt(vx**2+vy**2+vz**2)
-                    draw_info(color_image, 5, 80, fx, fy, fz, vx, vy, vz, speed_p, col_p)
+                    draw_info(color_image, 5, 130, fx, fy, fz, vx, vy, vz, speed_p, col_p)
 
                 # LSTM — 주 트랙만 적용
                 if lstm_pred and dv>0:
