@@ -122,10 +122,15 @@ if ENABLE_STREAMING:
     # NVENC(하드웨어 인코더) 우선 시도 → 실패 시 x264(소프트웨어)로 폴백
     # NVENC: Jetson Nano 내장 HW 인코더, CPU 부하 0 → 2~4ms 절약
     # x264: 소프트웨어 인코더, CPU 2~5ms 소비
+    # nvv4l2h264enc는 NVMM(GPU 공유 메모리) 형식만 허용
+    # videoconvert: BGR→I420 (CPU 메모리)
+    # nvvidconv:    I420 → NVMM I420 (GPU 공유 메모리로 변환) ← 핵심
+    # nvv4l2h264enc: NVMM I420 → H.264 HW 인코딩
     _nvenc_pipeline = (
         "appsrc ! "
         "videoconvert ! "
-        "video/x-raw,format=I420 ! "
+        "nvvidconv ! "
+        "video/x-raw(memory:NVMM),format=I420 ! "
         "nvv4l2h264enc bitrate=800000 preset-level=1 insert-vui=1 ! "
         "video/x-h264,stream-format=byte-stream ! "
         "h264parse ! "
