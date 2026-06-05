@@ -192,86 +192,192 @@ python3 jetson_inference_advanced.py [옵션...]
 ## 3. 단일 인수 실행 명령어
 
 ### 3-1. 스트리밍 (`--stream`)
+
 ```bash
+# 스트리밍 ON — GCS PC로 H.264 UDP 전송 (NVENC 자동, 실패 시 x264 폴백)
 python3 jetson_inference_advanced.py --stream on
+
+# 스트리밍 OFF — 로컬 모니터에만 표시, CPU 부하 감소 (기본값)
 python3 jetson_inference_advanced.py --stream off
 ```
 
+---
+
 ### 3-2. 칼만 모델 (`--model`)
+
 ```bash
+# CV — 등속도 6D 선형 칼만, 가장 빠름, 직선 이동 패드 적합 (기본값)
 python3 jetson_inference_advanced.py --model cv
+
+# CA — 등가속도 9D 선형 칼만, 드론 가감속 기동 추적
 python3 jetson_inference_advanced.py --model ca
+
+# CTRV — 선회율 7D 비선형 EKF, 드론 선회 기동 최적, 일반 착륙 권장
 python3 jetson_inference_advanced.py --model ctrv
+
+# IMM — CV+CTRV 확률 가중 혼합, 직선↔선회 자동 전환, 복합 기동
 python3 jetson_inference_advanced.py --model imm
 ```
 
+---
+
 ### 3-3. 추적 방식 (`--tracker`)
+
 ```bash
+# single — YOLO 출력 중 최고 score 1개만 추적, 단순하고 빠름 (기본값)
 python3 jetson_inference_advanced.py --tracker single
+
+# bytetrack — 3단계 IoU 매칭으로 다중 객체 추적, ID 유지 및 재진입 처리
 python3 jetson_inference_advanced.py --tracker bytetrack
 ```
 
-### 3-4. LSTM 예측 (`--predict`)
+---
+
+### 3-4. LSTM 미래 예측 (`--predict`)
+
 ```bash
-python3 jetson_inference_advanced.py --predict 0    # 비활성 (기본)
+# LSTM 비활성 — 추가 연산 없음 (기본값)
+python3 jetson_inference_advanced.py --predict 0
+
+# 5스텝 예측 — 약 0.17초(5/30fps) 미래 위치 점 5개 표시
 python3 jetson_inference_advanced.py --predict 5
+
+# 10스텝 예측 — 약 0.33초 미래 위치 점 10개 표시
 python3 jetson_inference_advanced.py --predict 10
+
+# 15스텝 예측 — 약 0.5초 미래 위치 점 15개 표시 (권장)
 python3 jetson_inference_advanced.py --predict 15
+
+# 20스텝 예측 — 약 0.67초 미래 위치 점 20개 표시
 python3 jetson_inference_advanced.py --predict 20
+
+# 30스텝 예측 — 약 1초 미래 위치 점 30개 표시 (LSTM 학습 부담 큼)
 python3 jetson_inference_advanced.py --predict 30
 ```
 
-### 3-5. EIS 안정화 (`--eis`, `--eis-smoothing`)
+---
+
+### 3-5. EIS 영상 안정화 (`--eis`, `--eis-smoothing`)
+
 ```bash
+# EIS ON — Lucas-Kanade 광류로 드론 진동 보정, 5~8ms 추가 비용
 python3 jetson_inference_advanced.py --eis on
+
+# EIS ON + 스무딩 5 — 빠른 반응, 약한 안정화 (빠른 접근 기동 적합)
 python3 jetson_inference_advanced.py --eis on --eis-smoothing 5
+
+# EIS ON + 스무딩 7 — 반응과 안정화의 균형 (기본값, 일반 착륙)
 python3 jetson_inference_advanced.py --eis on --eis-smoothing 7
+
+# EIS ON + 스무딩 10 — 강한 안정화, 느린 반응 (진동 심한 환경)
 python3 jetson_inference_advanced.py --eis on --eis-smoothing 10
+
+# EIS ON + 스무딩 15 — 최대 안정화, 정호버링 상태에서 사용
 python3 jetson_inference_advanced.py --eis on --eis-smoothing 15
+
+# EIS OFF — 안정화 없음, 0ms 추가 비용 (기본값)
 python3 jetson_inference_advanced.py --eis off
 ```
 
-### 3-6. MOTP 평가 (`--motp`, `--motp-log`)
+---
+
+### 3-6. MOTP 추적 정밀도 평가 (`--motp`, `--motp-log`)
+
 ```bash
+# MOTP 활성 + CSV 저장 — 실시간 정밀도 계산 및 종료 시 motp_log.csv 저장 (기본 동작)
 python3 jetson_inference_advanced.py --motp
+
+# MOTP 활성 + CSV 저장 명시 — 위와 동일 (--motp-log on 이 기본값)
 python3 jetson_inference_advanced.py --motp --motp-log on
+
+# MOTP 활성 + CSV 저장 안 함 — 화면 표시만, 메모리 절약
 python3 jetson_inference_advanced.py --motp --motp-log off
 ```
 
-### 3-7. 궤적 로그 (`--traj-log`)
+---
+
+### 3-7. 궤적 로그 저장 (`--traj-log`)
+
 ```bash
+# 궤적 CSV 저장 ON — 종료 시 trajectory_log.csv 에 위치·속도 이력 저장
 python3 jetson_inference_advanced.py --traj-log on
+
+# 궤적 CSV 저장 OFF — 데이터 누적 없음, 메모리 절약 (기본값)
 python3 jetson_inference_advanced.py --traj-log off
 ```
 
-### 3-8. MAVLink 연결 (`--mav`, `--mav-timeout`)
+---
+
+### 3-8. MAVLink 연결 방식 (`--mav`, `--mav-timeout`)
+
 ```bash
+# 기본 수신 대기 — 0.0.0.0:14551 에서 FC의 패킷 수신 대기 (기본값)
 python3 jetson_inference_advanced.py --mav udpin:0.0.0.0:14551
+
+# SITL PC 송신 — Jetson이 먼저 연결 요청, Heartbeat 빠르게 수신
 python3 jetson_inference_advanced.py --mav udpout:192.168.0.10:14550
+
+# 특정 인터페이스 고정 — 단일 NIC 에서만 수신, 노이즈 패킷 차단
 python3 jetson_inference_advanced.py --mav udpin:192.168.0.5:14551
+
+# USB-UART 직렬 연결 — 가장 빠르고 안정적인 FC 연결 방식
 python3 jetson_inference_advanced.py --mav /dev/ttyUSB0
+
+# 타임아웃 0초 — FC 없이 즉시 영상 처리 시작 (Heartbeat 대기 없음)
 python3 jetson_inference_advanced.py --mav-timeout 0
+
+# 타임아웃 1초 — FC 확실히 연결된 실기체 환경, 빠른 시작
 python3 jetson_inference_advanced.py --mav-timeout 1
+
+# 타임아웃 3초 — 일반적인 SITL 환경, 약간의 여유 대기 (기본값)
 python3 jetson_inference_advanced.py --mav-timeout 3
+
+# 타임아웃 5초 — FC 부팅 느리거나 연결 불확실한 환경
 python3 jetson_inference_advanced.py --mav-timeout 5
 ```
 
-### 3-9. ArUco 탐지 (`--aruco`, `--aruco-dict`, `--marker-size`)
+---
+
+### 3-9. ArUco 마커 탐지 (`--aruco`, `--aruco-dict`, `--marker-size`)
+
 ```bash
+# ArUco ON — 절반 해상도(320×240) 탐지, ×2 복원, tvec 자세 추정 (기본 사전+크기)
 python3 jetson_inference_advanced.py --aruco on
+
+# 4X4_50 사전 — 4×4 코드, 최대 50 ID, 근거리 빠른 탐지 (기본값)
 python3 jetson_inference_advanced.py --aruco on --aruco-dict 4X4_50
+
+# 5X5_100 사전 — 5×5 코드, 최대 100 ID, 중거리 적합
 python3 jetson_inference_advanced.py --aruco on --aruco-dict 5X5_100
+
+# 6X6_250 사전 — 6×6 코드, 최대 250 ID, 원거리 또는 다중 마커 환경
 python3 jetson_inference_advanced.py --aruco on --aruco-dict 6X6_250
+
+# 7X7_1000 사전 — 7×7 코드, 최대 1000 ID, 대규모 마커 구분 필요 시
 python3 jetson_inference_advanced.py --aruco on --aruco-dict 7X7_1000
+
+# 마커 크기 0.3m — 30cm×30cm 마커 사용 시 (실물 크기와 반드시 일치)
 python3 jetson_inference_advanced.py --aruco on --marker-size 0.3
+
+# 마커 크기 0.5m — 50cm×50cm 마커 사용 시 (현재 사용 마커, 기본값)
 python3 jetson_inference_advanced.py --aruco on --marker-size 0.5
+
+# 마커 크기 1.0m — 1m×1m 대형 마커, 원거리 인식
 python3 jetson_inference_advanced.py --aruco on --marker-size 1.0
+
+# ArUco OFF — ArUco 탐지 비활성, YOLO+depth 방식만 사용 (기본값)
 python3 jetson_inference_advanced.py --aruco off
 ```
 
-### 3-10. 출력 제어 (`--verbose`)
+---
+
+### 3-10. 루프 출력 제어 (`--verbose`)
+
 ```bash
+# verbose ON — 매 프레임 탐지 결과·MAVLink 송출 정보 터미널 출력 (디버그용)
 python3 jetson_inference_advanced.py --verbose on
+
+# verbose OFF — 루프 print 제거, 0.4~2.6ms/frame 절약, 30fps 유지 유리 (기본값)
 python3 jetson_inference_advanced.py --verbose off
 ```
 
@@ -280,14 +386,18 @@ python3 jetson_inference_advanced.py --verbose off
 ## 4. 상황별 권장 조합 명령어
 
 ### 4-1. 기본 실행 (옵션 없음)
+
 ```bash
+# 모든 기본값 사용: stream off, cv 모델, single 추적, ArUco off, 로컬 화면만
 python3 jetson_inference_advanced.py
 ```
 
 ---
 
 ### 4-2. 실기체 착륙 — USB-UART 직렬 연결
+
 ```bash
+# 스트리밍 ON + CTRV 모델 + USB 직렬 FC 연결 (가장 빠르고 안정적인 구성)
 python3 jetson_inference_advanced.py \
     --stream on \
     --model ctrv \
@@ -297,7 +407,9 @@ python3 jetson_inference_advanced.py \
 ---
 
 ### 4-3. 실기체 착륙 — ArUco 마커 정밀 착륙
+
 ```bash
+# CTRV + ArUco 50cm 마커 탐지 → YOLO보다 정밀한 tvec 기반 자세 추정
 python3 jetson_inference_advanced.py \
     --stream on \
     --model ctrv \
@@ -309,7 +421,9 @@ python3 jetson_inference_advanced.py \
 ---
 
 ### 4-4. SITL 시뮬레이터 테스트
+
 ```bash
+# PC SITL에 udpout으로 먼저 연결, 1초 타임아웃으로 빠른 시작
 python3 jetson_inference_advanced.py \
     --stream on \
     --model ctrv \
@@ -320,7 +434,9 @@ python3 jetson_inference_advanced.py \
 ---
 
 ### 4-5. ByteTrack 다중 객체 추적
+
 ```bash
+# ByteTrack으로 다중 착륙 패드 추적, 주 트랙(최고 score)만 MAVLink 송신
 python3 jetson_inference_advanced.py \
     --stream on \
     --model ctrv \
@@ -331,7 +447,9 @@ python3 jetson_inference_advanced.py \
 ---
 
 ### 4-6. 드론 진동 심할 때 — EIS 활성화
+
 ```bash
+# EIS smoothing 7 — 진동 보정으로 YOLO 인식률 향상, 5~8ms 추가 비용
 python3 jetson_inference_advanced.py \
     --stream on \
     --model ctrv \
@@ -345,7 +463,9 @@ python3 jetson_inference_advanced.py \
 ---
 
 ### 4-7. 30fps 최우선 — 최대 성능 조합
+
 ```bash
+# verbose off(기본) + NVENC 자동 + udpout 빠른 연결 + 1초 타임아웃
 python3 jetson_inference_advanced.py \
     --stream on \
     --model ctrv \
@@ -359,7 +479,9 @@ python3 jetson_inference_advanced.py \
 ---
 
 ### 4-8. LSTM 미래 예측 활성화
+
 ```bash
+# ByteTrack 주 트랙 기준 15스텝 앞 위치 예측 → 화면에 점 15개 표시
 python3 jetson_inference_advanced.py \
     --stream on \
     --model ctrv \
@@ -371,7 +493,9 @@ python3 jetson_inference_advanced.py \
 ---
 
 ### 4-9. IMM 모델 + ByteTrack (복합 기동)
+
 ```bash
+# IMM — 직선/선회 자동 전환 + ByteTrack — 다중 ID 유지
 python3 jetson_inference_advanced.py \
     --stream on \
     --model imm \
@@ -384,7 +508,9 @@ python3 jetson_inference_advanced.py \
 ---
 
 ### 4-10. 연구용 풀 옵션 — 로그 전체 저장
+
 ```bash
+# 모든 기능 활성 + motp_log.csv + trajectory_log.csv 동시 저장
 python3 jetson_inference_advanced.py \
     --stream on \
     --model ctrv \
@@ -402,7 +528,9 @@ python3 jetson_inference_advanced.py \
 ---
 
 ### 4-11. FC 없이 영상 처리만 — 개발·테스트
+
 ```bash
+# mav-timeout 0으로 FC 대기 없이 즉시 시작, verbose on으로 결과 확인
 python3 jetson_inference_advanced.py \
     --stream off \
     --model cv \
@@ -414,7 +542,9 @@ python3 jetson_inference_advanced.py \
 ---
 
 ### 4-12. 디버그 모드 — 모든 출력 활성
+
 ```bash
+# verbose on으로 매 프레임 탐지·MAVLink 결과 출력, MOTP도 함께 표시
 python3 jetson_inference_advanced.py \
     --stream off \
     --model cv \
@@ -426,7 +556,9 @@ python3 jetson_inference_advanced.py \
 ---
 
 ### 4-13. ArUco + ByteTrack + 다중 마커 환경
+
 ```bash
+# 6X6_250 사전으로 최대 250개 마커 구분, IMM으로 복합 기동 대응
 python3 jetson_inference_advanced.py \
     --stream on \
     --model imm \
@@ -441,7 +573,9 @@ python3 jetson_inference_advanced.py \
 ---
 
 ### 4-14. 궤적 + MOTP 로그 저장 — 분석용
+
 ```bash
+# 비행 후 정밀도 분석: motp_log.csv + trajectory_log.csv 동시 수집
 python3 jetson_inference_advanced.py \
     --stream on \
     --model ctrv \
@@ -479,20 +613,24 @@ python3 jetson_inference_advanced.py \
 ## 6. 종료 방법
 
 ```bash
-# 방법 1 — Ctrl+C (터미널에서, 가장 확실)
+# 방법 1 — Ctrl+C : 터미널에서 바로 사용, 가장 확실한 종료 방법
 ^C
 
-# 방법 2 — q 키
-# "Jetson Local View" 창을 마우스로 클릭하여 포커스 이동 후 q 입력
-# ※ 터미널에서 q를 눌러도 동작하지 않음 (cv2 창 포커스 필요)
+# 방법 2 — q 키 : "Jetson Local View" 창을 마우스로 클릭하여 포커스 이동 후 q 입력
+#           ※ 터미널에서 q를 눌러도 동작하지 않음 (cv2 창 포커스 필요)
+q
 ```
 
 **종료 시 자동 처리:**
-- `motp_log.csv` 저장 (`--motp --motp-log on` 시)
-- `trajectory_log.csv` 저장 (`--traj-log on` 시)
-- RealSense 파이프라인 정상 종료
-- GStreamer 스트림 정상 종료
-- CUDA GPU 메모리 해제
+
+```
+# --motp --motp-log on 설정 시 → motp_log.csv 자동 저장
+# --traj-log on 설정 시 → trajectory_log.csv 자동 저장
+# RealSense 파이프라인 정상 종료 (pipeline.stop())
+# GStreamer 스트림 정상 종료 (out.release())
+# CUDA GPU 메모리 해제 (cudaFree)
+# OpenCV 윈도우 닫기 (cv2.destroyAllWindows())
+```
 
 ---
 
